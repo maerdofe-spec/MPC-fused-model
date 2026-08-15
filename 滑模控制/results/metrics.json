@@ -1,0 +1,10 @@
+{
+  "depth_rmse_m": 0.16536274696139566,
+  "depth_max_abs_error_m": 0.9963766413948536,
+  "depth_final_mean_abs_error_m": 0.0036229652673669386,
+  "yaw_rmse_deg": 14.816174667790904,
+  "yaw_max_abs_error_deg": 89.95741017296997,
+  "yaw_final_mean_abs_error_deg": 0.08196286516079127,
+  "max_abs_heave_force_n": 38.81671944678144,
+  "max_abs_yaw_moment_nm": 7.261975325589883
+}
