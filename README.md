@@ -1,8 +1,8 @@
 # FineSUB MPC 控制
 
-本仓库包含单模型、双模型融合以及带偏航控制的 MPC。四个模型均已接入统一
-实机入口 `rov_track_control3.py`，并通过树莓派 TCP-UART 桥接到
-`v4ROV2/FineSUB` 的 USART3。
+本仓库包含单模型、双模型融合以及带偏航控制的 MPC。正式实机运行采用独立的
+无手柄 AUTO-only 入口 `finesub_auto_control.py`，模型固定为 `dual-yaw`；旧
+`rov_track_control3.py` 只保留手动/CSRT 查看用途，不能进入 AUTO。
 
 ## 克隆完整工程
 
@@ -29,15 +29,18 @@ git submodule update --init --recursive
 `MPC_dual_model/finesub_protocol.py` 按标定值转换为固件混控器的归一化
 `[forward, right, down, yaw]` 通道。
 
-v3 控制帧包含版本、显式解锁位、yaw 控制来源、随机会话号、16 位序号、发送
+v5 控制帧包含版本、显式解锁位、yaw 控制来源、随机会话号、16 位序号、发送
 时间和 CRC-16/MODBUS，新会话必须先完成停桨握手。下位机以 20 Hz 回传完整
 IMU、深度/压力、命令接受或拒绝原因、混控后真正下发的 8 路电机油门以及
-8 路 DSHOT RPM。上位机将 8 路实际输出反解成上一拍实际力和力矩，供四套
-MPC 的状态估计和模型预测使用。只有遥测、执行反馈和命令确认均新鲜时才能
+8 路 DSHOT RPM。活动 AUTO 目前用最终实际下发的 8 路电机油门反算上一拍
+平移力/偏航力矩；RPM 与同艇推力曲线并行留作诊断，尚不冒充真实测力。
+该执行量估计供状态估计和模型预测使用。只有遥测、执行反馈和命令确认均新鲜时才能
 进入自动 MPC；固件连续 250 ms 没有接受合法 MPC 帧时会清零并停桨。
 
-完整帧格式、拒绝原因和安全状态机见
-`docs/finesub_mpc_protocol_v3_zh-CN.md`。
+完整帧格式、拒绝原因和安全状态机见协议文档与
+`MPC_dual_model/finesub_protocol.py`。
+
+以下 `--model` 表只适用于仿真、库示例和旧诊断程序，不适用于正式 AUTO：
 
 | `--model` | 平移控制 | yaw 控制 |
 |---|---|---|
@@ -46,17 +49,50 @@ MPC 的状态估计和模型预测使用。只有遥测、执行反馈和命令�
 | `dual` | 双模型融合 MPC | 下位机本地航向保持 |
 | `dual-yaw` | 双模型融合 MPC | 上位机 yaw 状态机与双环控制 |
 
-## 运行
+## 正式 AUTO 运行
 
-在本目录安装依赖并启动：
+在本目录由 uv 管理依赖。默认命令只预检，不连接硬件：
 
 ```powershell
-python -m pip install -r MPC_dual_model_yaw/requirements-live.txt
-python rov_track_control3.py --model dual-yaw
+uv sync --project MPC_dual_model --group dev
+uv run --project MPC_dual_model python finesub_auto_control.py
 ```
 
-将最后一个参数替换为 `model1`、`model2` 或 `dual` 即可运行另外三套模型；
-不传 `--model` 时默认使用 `dual-yaw`。
+只有预检输出 `AUTO READY` 后才运行：
+
+```powershell
+uv run --project MPC_dual_model python finesub_auto_control.py --execute
+```
+
+当前实机配置仍会输出 `AUTO BLOCKED`，原因是相机刚性外参与完整三轴实机动力学没有通过
+接受门。阻断发生在创建 UDP/串口 transport 之前。正式入口没有 joystick、MANUAL、ROI/CSRT
+或 `--model` 参数，也不会用仿真默认值补齐实机参数。
+
+### 风险接受的首次实机追踪实验
+
+操作者在 2026-08-13 明确接受当前外参与 sway/heave 候选误差，并要求停止重复测量、尽快进行
+MPC+红鱼视觉实物追踪。为避免把实验结论伪装成正式批准，独立预检入口为：
+
+```powershell
+uv run --project MPC_dual_model python finesub_experimental_auto.py
+```
+
+预检输出 `EXPERIMENTAL AUTO READY` 后，实验执行命令为：
+
+```powershell
+uv run --project MPC_dual_model python finesub_experimental_auto.py --execute
+```
+
+若视觉系统每次在新的时间戳目录写结果，可由 MPC 只读指定该文件：
+
+```powershell
+uv run --project MPC_dual_model python finesub_experimental_auto.py --execute --vision-jsonl /absolute/path/to/pipeline_results.jsonl
+```
+
+实验固定使用 `dual-yaw`、目标相机光轴距离 `0.60 m`（当前候选外参对应 body FRD
+`[0.857634,-0.055545,-0.120815] m`），当前 forward/right/down 最大通道均为
+`+/-0.20`，默认不计时，由操作员 `Ctrl+C` 或安全故障结束。heave 模型使用实测净上浮外力
+`-0.807290 N`，对应 Fossen 方程中的下向悬浮平衡力 `+0.807290 N`。实验 AUTO 不使用检测器置信度下限；通过深度/创新/范围/运动门的视觉坐标更新 MPC。视觉间隙时平移受变化率限制退回 `tau_h`，直接 yaw 力矩退回武装基线，下位机继续稳定 roll/pitch。每次执行自动保存逐帧 JSONL，包含相机/机体位置、估计状态、平移力、直接 yaw 力矩、通道、RPM、模型权重和停止原因。遥测、命令确认、通信或 QP 故障仍会解除武装并停止。该入口不会修改正式 `auto_runtime.enabled=false`。
 
 通信方式、地址、安全时间和硬件换算参数位于：
 
@@ -67,20 +103,20 @@ MPC_dual_model/finesub_v4pro1_mpc.json
 也可以指定其他配置：
 
 ```powershell
-python rov_track_control3.py --model dual --config path/to/finesub.json
+uv run --project MPC_dual_model python finesub_auto_control.py --config path/to/finesub.json
 ```
 
 配置中的 `transport.type` 支持 `tcp`、`udp`、`serial` 和 `dry_run`。
 
 ### 实际执行反馈的定义
 
-目前 MPC 使用的是“下位机最终施加的电机输出”反解得到的已实现控制量；真实
-RPM 也会回传和显示。由于暂时没有当前实艇每台推进器经过实测的“正反转
-RPM—推力”标定曲线，所以不会直接把 RPM 当作牛顿推力。完成水池标定并把曲线
-写入硬件适配配置后，才能进一步启用真正的 RPM—推力闭环。
+MPC 使用 8 路真实 RPM 与逐电机正反向二次曲线重构已实现控制量。
+当前同艇历史测力曲线与本艇 `+/-5/7.5/10%` RPM 支持低限幅力换算，
+但垂直推进器曲线仍是按同推进单元旋向组迁移，这不等于完整三轴动力学已经获批。
 
-当前闭环使用下位机经过混控、方向修正和限幅后最终写给8个电调的输出；RPM
-目前用于执行诊断和后续标定。不得直接套用其他艇或其他推进器的占位曲线。
+水平四桨或垂直四桨的 RPM 有效位不完整时，闭环只对该组回退到下位机经过混控、
+方向修正和限幅后的最终电机设定值反算；trace 会记录每轴来源。不得直接套用其他艇
+或其他推进器的占位曲线。
 
 ### 烧录新固件
 
@@ -94,9 +130,8 @@ RPM—推力”标定曲线，所以不会直接把 RPM 当作牛顿推力。完
 视频输入还要求操作系统已安装 GStreamer、H.264 解码插件和 PyGObject (`gi`)；
 这些组件应使用目标机的系统包管理器安装。
 
-- `S`：框选目标；`Z`：停止跟踪；`Q`：退出。
-- 手柄按钮 7：解锁/停桨。
-- 手柄按钮 3：切换 MANUAL/AUTO。
+旧 `rov_track_control3.py` 仍可用于手动/CSRT 诊断：`S` 框选、`Z` 停止、`Q` 退出，
+按钮 7 手动解锁/停桨；按钮 3 只会打印 `AUTO BLOCKED`，不会切换模式。
 
 程序退出时会发送显式停桨帧。没有视频、遥测过期、命令确认过期、网络中断或
 上位机停止发帧时，下位机看门狗仍会停桨；通信恢复后不会自动重新解锁。
@@ -104,10 +139,8 @@ RPM—推力”标定曲线，所以不会直接把 RPM 当作牛顿推力。完
 ## 验证
 
 ```powershell
-$env:PYTHONPATH="$PWD;$PWD/MPC_dual_model"
-python -m unittest discover -s MPC_dual_model/tests -v
-$env:PYTHONPATH="$PWD"
-python -m unittest discover -s MPC_dual_model_yaw/tests -v
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
+uv run --project MPC_dual_model pytest -q MPC_dual_model/tests
 ```
 
 ## 下水前必须标定

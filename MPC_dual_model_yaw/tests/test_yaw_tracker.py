@@ -19,6 +19,7 @@ from MPC_dual_model_yaw.yaw_kalman import (
     RotationAwareKalmanFilter,
 )
 from MPC_dual_model_yaw.live_integration_example import (
+    build_hardware_adapter,
     build_tracker as build_live_tracker,
     one_control_update,
 )
@@ -109,52 +110,67 @@ class YawTrackerTest(unittest.TestCase):
             DEFAULT_PREDICTION_HORIZON_WEIGHTS,
         )
 
-    def test_live_builder_matches_tuned_translation_baseline(self) -> None:
+    def test_live_builder_matches_active_real_device_parameters(self) -> None:
         tracker = build_live_tracker()
         config = tracker.controller.config
-        np.testing.assert_allclose(config.position_weights, (10000, 14000, 25000))
-        np.testing.assert_allclose(config.velocity_weights, (2, 20, 12))
-        np.testing.assert_allclose(config.force_weights, (0.003, 0.002, 0.04))
-        np.testing.assert_allclose(config.delta_force_weights, (0.01, 0.01, 0.5))
+        np.testing.assert_allclose(
+            np.diag(tracker.model.translation.M_t), (24.82, 26.26, 26.257826)
+        )
+        np.testing.assert_allclose(
+            np.diag(tracker.model.translation.D_L), (9.589, 14.964789, 11.290874)
+        )
+        self.assertAlmostEqual(tracker.model.dt, 0.10)
+        np.testing.assert_allclose(
+            tracker.model.translation.restoring_force, (0.0, 0.0, 0.80729)
+        )
+        self.assertEqual(config.horizon, 10)
+        self.assertEqual(config.terminal_weight_scale, 2.0)
+        np.testing.assert_allclose(config.position_weights, (500, 350, 900))
+        np.testing.assert_allclose(config.velocity_weights, (100, 150, 200))
+        np.testing.assert_allclose(config.force_weights, (0.5, 0.5, 0.8))
+        np.testing.assert_allclose(config.delta_force_weights, (4, 0.5, 3))
         np.testing.assert_allclose(
             config.force_min,
-            (-20.9251281329410, -20.9251281329410, -31.7116),
+            (-5.050680, -4.783308, -6.867140),
         )
         np.testing.assert_allclose(
             config.force_max,
-            (20.9251281329410, 20.9251281329410, 27.4736),
+            (4.730162, 4.997534, 7.063140),
         )
-        self.assertEqual(config.thruster_wrench_matrix.shape, (6, 8))
+        np.testing.assert_allclose(config.delta_force_max, (0.8, 0.8, 1.0))
+        np.testing.assert_allclose(
+            config.reference_position, (0.857634, -0.055545, -0.120815)
+        )
+        self.assertEqual(config.thruster_wrench_matrix.shape, (4, 8))
         self.assertEqual(config.thruster_force_min.shape, (8,))
         self.assertEqual(config.thruster_force_max.shape, (8,))
         yaw_config = tracker.yaw_controller.config
-        self.assertAlmostEqual(tracker.model.yaw.effective_inertia, 0.8)
-        self.assertAlmostEqual(tracker.model.yaw.linear_damping, 0.8)
-        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_on), 1.8)
-        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_off), 0.7)
-        self.assertAlmostEqual(yaw_config.outer_kp, 4.0)
-        self.assertAlmostEqual(yaw_config.inner_kp, 2.0)
-        self.assertAlmostEqual(yaw_config.yaw_moment_max, 1.5)
-        self.assertTrue(tracker.baseline_adaptation.enabled)
-        self.assertEqual(tracker.baseline_adaptation.update_mode, "gated_ema")
+        self.assertAlmostEqual(tracker.model.yaw.effective_inertia, 0.33453415)
+        self.assertAlmostEqual(tracker.model.yaw.linear_damping, 0.32251723)
+        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_on), 3.0)
+        self.assertAlmostEqual(np.rad2deg(yaw_config.alpha_off), 1.2)
+        self.assertAlmostEqual(yaw_config.outer_kp, 1.5)
+        self.assertAlmostEqual(yaw_config.inner_kp, 0.6)
+        self.assertAlmostEqual(yaw_config.yaw_moment_max, 1.807854)
+        self.assertFalse(hasattr(tracker, "baseline_adaptation"))
 
-    def test_live_baseline_updates_each_eligible_axis(self) -> None:
+    def test_live_tracker_uses_previous_achieved_force_without_ema(self) -> None:
         tracker = build_live_tracker()
-        output = tracker.update(
+        achieved = np.array([4.0, -2.0, 1.0])
+        tracker.update(
             position_body=tracker.controller.config.reference_position,
             yaw_rad=0.0,
             yaw_rate_rad_s=0.0,
-            force_achieved_previous=(5.0, -2.0, 1.0),
+            force_achieved_previous=achieved,
             yaw_moment_achieved_previous=0.0,
         )
-        np.testing.assert_allclose(
-            tracker.model.translation.tau_base,
-            (0.05, -0.02, 0.01),
-        )
-        self.assertLessEqual(
-            tracker.controller.thruster_utilization(output.mpc.force),
-            1.0 + 1.0e-8,
-        )
+        np.testing.assert_allclose(tracker._previous_achieved_force, achieved)
+        np.testing.assert_allclose(tracker.model.translation.tau_base, np.zeros(3))
+
+    def test_live_hardware_feedback_keeps_rpm_diagnostic_only(self) -> None:
+        adapter = build_hardware_adapter()
+        self.assertFalse(adapter.use_rpm_for_force_estimate)
+        self.assertTrue(adapter.log_rpm_force_estimate)
 
     def test_live_fallback_respects_asymmetric_thruster_envelope(self) -> None:
         tracker = build_live_tracker()
@@ -177,16 +193,16 @@ class YawTrackerTest(unittest.TestCase):
                 force_without_yaw, target, yaw_moment=0.0
             )
             force_with_yaw = controller._safe_fallback(
-                force_with_yaw, target, yaw_moment=4.0
+                force_with_yaw, target, yaw_moment=1.0
             )
 
         self.assertLess(force_with_yaw[0], force_without_yaw[0])
         self.assertLessEqual(
-            controller.thruster_utilization(force_with_yaw, yaw_moment=4.0),
+            controller.thruster_utilization(force_with_yaw, yaw_moment=1.0),
             1.0 + 1.0e-10,
         )
 
-    def test_qp_allocation_reproduces_full_wrench_without_roll_or_pitch(self) -> None:
+    def test_qp_allocation_reproduces_real_planar_wrench(self) -> None:
         tracker = build_live_tracker()
         output = tracker.update(
             position_body=(0.8, 0.2, 0.0),
@@ -200,8 +216,7 @@ class YawTrackerTest(unittest.TestCase):
             @ output.mpc.thruster_force
         )
         np.testing.assert_allclose(wrench[:3], output.mpc.force, atol=2.0e-4)
-        np.testing.assert_allclose(wrench[3:5], 0.0, atol=2.0e-4)
-        self.assertAlmostEqual(wrench[5], output.mpc.yaw_moment, places=4)
+        self.assertAlmostEqual(wrench[3], output.mpc.yaw_moment, places=4)
 
     def test_rotating_tracker_keeps_and_masks_exact_staircase_cells(self) -> None:
         tracker, _ = self.build()

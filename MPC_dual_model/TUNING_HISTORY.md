@@ -2,6 +2,409 @@
 
 This file records tested parameter sets that may need to be restored exactly.
 
+## 2026-08-15: offline horizon/forward-force balance candidate
+
+The two latest actuator-model traces were replayed with the confirmed visual
+misidentification interval removed from
+`experimental_auto_20260815_201912.jsonl` (`frame 22459--22516`).  Increasing
+forward position weight or reducing forward absolute-force cost alone changed
+the predicted terminal forward P95 by only a few millimetres while increasing
+the first force command.  A longer horizon provided the useful part of the
+dynamic preview, but an unweighted `horizon=15` raised force-rate activity too
+much.
+
+The current experimental candidate therefore uses:
+
+```text
+horizon = 15
+position_weights = [800, 350, 900]
+velocity_weights = [150, 150, 200]
+force_weights = [0.60, 0.50, 0.80]
+delta_force_weights = [5.0, 0.5, 3.0]
+```
+
+The change is upper-computer only.  It has passed the translation regression
+suite and `EXPERIMENTAL AUTO READY`, but it has not yet been validated on the
+vehicle.  No vision, lower-controller PID/mixing, `tau_h`, actuator model,
+force limits, or final motor limits were changed.
+
+## 2026-08-15: actuator delay queue completed offline, still disabled in AUTO
+
+The optional upper-computer actuator model now retains the command-delay queue
+between successive MPC solves.  Each solve re-anchors the current actuator
+force to the measured `tau_achieved` while preserving commands that are still
+inside the configured pure-delay queue.  The first-order actuator state and
+`predicted_actuator_force_sequence` therefore no longer restart from the
+latest achieved force on every solve.  `reset()` clears the queue.
+
+The active experimental JSON remains unchanged:
+
+```text
+actuator_model_enabled = false
+actuator_pure_delay_s = 0.08
+actuator_time_constant_s = 0.15
+```
+
+These values remain offline candidates, not accepted real-device parameters.
+Fixed-state replay of the two latest traces with the candidate enabled reduced
+forward force-command P95 from approximately `4.40` to `4.12 N` in the short
+retry and from `4.57` to `4.28 N` in the preceding long run.  Forward force
+limit occupancy fell from about `4.3%` to `1.2%` and from `4.4%` to `2.3%`,
+respectively.  This is not a closed-loop performance claim; the replay used
+recorded states and forces.  No lower-controller firmware or vision code was
+changed, and the model is not enabled for the next armed run until a separate
+pool-top-camera comparison is completed.
+
+## 2026-08-15: translation gated-EMA model-1 base restored
+
+At the operator's request, only the translation `MPC_dual_model` tracker has
+returned from the per-update base slew limiter to the earlier per-axis
+`gated_ema` rule.  Eligible axes use `alpha=0.03` outside the strict steady
+region and `alpha=0.01` inside it; eligibility remains `|position error| <=
+0.20 m` and `|relative velocity| <= 0.08 m/s`, with strict steady thresholds
+`0.03 m` and `0.02 m/s`.  All three FRD axes are enabled.
+
+The independent Fossen term `tau_h=[0,0,0.807290] N`, model-2 equation,
+absolute-total-force cost, actual-force rate reference, yaw-frame rotation,
+camera constraints, and fallback to `tau_h` remain unchanged.  The
+rotation-aware `MPC_dual_model_yaw` tracker is intentionally not changed in
+this step.
+
+## 2026-08-15: absolute-total-force cost restored for startup overshoot
+
+The latest fusion run showed a large startup burst while `tau_base` and the
+adaptive model-1 weight were still ramping from their initial values.  The QP
+was previously centered by the fusion-weighted reference
+`tau_eq=W*tau_base+(I-W)*tau_h`, which created a linear incentive to preserve a
+large nonzero propulsion force.  The active controller now uses
+
+```text
+J_force = sum_j tau[j]^T R tau[j]
+```
+
+The dual-model state equations, fixed-per-solve `tau_base`, independent
+`tau_h`, actual-force rate reference, force limits, and delta-force cost are
+unchanged.  `MPCResult.force_reference` remains only as a compatibility trace
+field and is now zero.  This is an upper-computer change; it does not require
+lower-controller firmware or vision changes.  The next water run must compare
+startup overshoot and stationary error before changing position or fusion
+weights.
+
+## Next physical session: firmware first, then a fixed-model-2 isolation run
+
+The operator shut down the hardware after the 2026-08-15 offline fusion
+validation.  Before the next physical test, compile and flash the lower
+controller from `V4pro1_MPC`, then complete the normal disarmed/readiness
+checks.  This is an explicit operator request even though the proposed fusion
+experiment itself is an upper-computer change.
+
+The next proposed isolation changes only the **forward** fusion selection to
+fixed model 2 (`a1_forward=0`); right/down remain at their current adaptive
+settings so a forward diagnosis is not confounded by simultaneous heave/sway
+changes.  Do not change MPC costs, base slew, PID, vision, horizon, or limits
+in the same run.  This candidate is recorded as a plan and is not yet active
+in `finesub_v4pro1_mpc.json`.
+
+The water sequence is: stationary target for at least 10 s, one slow forward
+constant-speed pass, stationary stop for at least 10 s, then one reverse pass
+and final stop.  Interpret the result by phase:
+
+- If fixed model 2 still has poor stationary hold or low-frequency chasing,
+  fusion/model-1 memory is not the primary cause; investigate actuator
+  lag/deadband, variable vision timing, and then the forward MPC costs.
+- If stationary hold becomes clearly stable but stopping with adaptive fusion
+  was unstable, model-1 `tau_base` credibility/fusion is the primary cause.
+- Constant-speed lag under fixed model 2 is structurally expected because it
+  has no matched-speed operating-force feedforward.  That lag alone does not
+  prove the current position/force weights are wrong; compare it with the
+  stationary result and the earlier adaptive runs.
+
+## 2026-08-15: reject longer fusion history as a standalone model-separation fix
+
+The read-only validation tool `fusion_identifiability_validation.py` replayed
+five translation-only traces against their independently recorded overhead
+AprilTag bags.  Tag 17 supplied target motion and tags 15/16 supplied vehicle
+motion.  The aggregate contained 856 stationary samples, 1,038 matched-motion
+samples, and 481 stricter matched-motion samples for which both target and
+vehicle planar acceleration were below `0.04 m/s2`.  No hardware transport was
+opened and the active JSON was not changed.
+
+Actually retaining completed five- and eight-step predictions materially
+increased the forward candidate separation.  In strict steady cruise, median
+separation rose from `0.78 mm` with the maintained effective two-step
+staircase to `2.76/5.74 mm` at five/eight steps; P95 rose from `3.07 mm` to
+`11.14/21.66 mm`.  Separation magnitude alone did not make the selection
+correct: model 1 had lower scored MSE in only `40.1/39.3/41.2%` of strict
+steady-cruise samples for effective horizons `2/5/8`.  Even after requiring
+the logged base to change by less than `0.10 N/update` and differ from achieved
+force by less than `0.30 N`, the corresponding fractions were only
+`49.4/48.3/44.8%` over 174 samples.
+
+The tested evidence-insufficient fallback decayed toward model 2 instead of
+holding a stale model-1 weight.  With eight steps and a `1e-5 m2` threshold it
+reduced stationary samples above model-1 weight `0.5` to `3.4%`, but classified
+`72.4%` of matched-motion samples below `0.5`; its strict-cruise median weight
+was approximately `0.01`.  Higher `1e-4 m2` thresholds collapsed even more
+strongly to model 2.  Therefore neither longer fusion history nor a
+model-2 ambiguity default is accepted as the next real-device change: the
+combination mostly suppresses model 1 rather than identifying matched-speed
+motion.  The report is
+`calibration_logs/fusion_identifiability_validation_20260815.json`.
+
+The result isolates a deeper mismatch in the identification signal.  The
+logged applied-throttle force used as `tau_base` can still include correction,
+actuator lag/deadband, and dynamic thrust-map error; the fixed `0.10 s`
+propagation also accumulates error across real `0.10--0.20 s` vision intervals.
+In addition, candidates are scored against a Kalman posterior whose prior
+already uses the current fused model.  The next offline comparison must change
+only the scoring/timing evidence—raw measurement versus a model-independent
+posterior, then recorded variable-time propagation—before any fusion or MPC
+parameter is changed in water.
+
+## 2026-08-14: rate-limit the model-1 operating-force update
+
+The operator observed that the model tracked constant-speed motion better
+than a stationary target. In `experimental_auto_20260814_230123.jsonl`, after
+target motion ended, five-second forward-error P95 repeatedly reached roughly
+`20--54 cm`. During those chase cycles the adaptive forward model-1 weight
+rose as high as approximately `0.62--0.82`, while the per-solve base copied
+motion/correction force over approximately `-2.5--+1.4 N`. Increasing the
+forward delta-force cost to `6.0` was rejected and restored to `4.0` because
+it delayed unloading without preventing each achieved correction from
+becoming the next model-1 equilibrium.
+
+At the operator's request, model-1 base update and actual force-rate handling
+are now separated. The persistent base obeys
+`tau_base += clip(tau_achieved-tau_base, +/-base_slew_limit)` before each
+solve, then remains fixed over the complete horizon. The first planned-force
+difference still uses the unfiltered actual `tau_achieved`; therefore the
+actuator slew constraint and feedback truth are unchanged. The first trial
+used `[0.20,0.80,1.00] N/update`, so only forward was newly restricted, at a
+nominal `2 N/s` under the fixed `0.10 s` model step. The old horizontal EMA is
+not restored. Trace output records both the fixed limited base and its
+difference from achieved force.
+
+Frozen replay of the rejected trace reduced mean/P95 forward base change from
+`0.368/0.800 N` to `0.176/0.200 N`; the resulting first-step force-change
+bound fraction changed from `29.0%` to `26.2%`. This replay establishes the
+implemented limit but cannot predict the new closed-loop stopping behavior.
+
+The water run `experimental_auto_20260814_231713.jsonl` rejected the initial
+`0.20 N/update` rate as too slow. The operator moved the fish during part of
+the run, so those intervals are not labelled as stationary response. Across
+the full 2700-update trace, however, the forward base step was at its `0.20 N`
+limit in `75.8%` of adjacent updates, while `|tau_base-tau_achieved|` reached
+`0.418/3.669/5.930 N` at P50/P95/max. This directly demonstrates persistent
+base lag independent of target-motion labelling. The operator also observed
+the slow update in real time. Only the forward base limit is therefore raised
+to `0.40 N/update` (nominal `4 N/s`); right/down remain `0.80/1.00`, and all
+weights, force-rate limits, fusion, PID, and vision settings remain unchanged.
+Frozen replay of the same achieved-force sequence reduces forward
+`|tau_base-tau_achieved|` P50/P95/max from `0.418/3.669/5.930 N` at `0.20`
+to `0.000/2.376/4.829 N` at `0.40`; base updates at the selected limit fall
+from `76.0%` to `39.0%`. This verifies the intended reduction in lag but does
+not substitute for the next closed-loop water test.
+The post-stop disarmed check recorded 59 fresh frames with state IDLE, armed
+false, zero received channels and motor outputs, and no failsafe or rejection.
+
+The next water run `experimental_auto_20260814_234007.jsonl` showed that
+`0.40 N/update` was still too slow during repeated forward motion. Across
+1032 control updates, the forward base step was at the configured limit in
+`62.8%` of eligible updates and `|tau_base-tau_achieved|` reached
+`0.298/2.355/3.315 N` at P50/P95/max. The forward model-1 weight median was
+only `0.023`. The final collision interval also contained repeated visual
+holds and large right error, so it is not used as clean forward-response
+evidence. Frozen replay of the same achieved-force sequence, preserving
+reacquisition resets, predicts that a forward limit of `0.60 N/update`
+reduces base-lag P50/P95/max to `0.000/0.600/1.579 N`; `35.3%` of updates
+reach the new limit. The `0.60 N/update` water run
+`experimental_auto_20260814_234928.jsonl` then rejected that candidate. In
+the final ten seconds with the target held stationary, forward error remained
+about `-5 cm`, model-1 weight rose to a `0.973` median, and the base/achieved
+force means reached approximately `-3.67/-3.62 N`. The forward command mean
+was `-0.142` and hit the `-0.20` limit in `28%` of updates. The faster limiter
+therefore allowed correction force to become a false matched-speed
+equilibrium and did not restore static tracking. The active forward base
+limit is reverted to `0.40 N/update` as the safer prior value; this rollback
+does not claim that `0.40` solves the underlying observability and actuator-
+model problem. All other parameters remain unchanged.
+
+At the operator's request, the next single-parameter candidate is the midpoint
+`0.50 N/update`. Frozen replay of `experimental_auto_20260814_234007.jsonl`
+predicts forward base-lag P50/P95/max of `0.000/1.353/2.415 N`, with `48.9%`
+of eligible updates at the limit. This is only an open water-test candidate;
+it has not yet demonstrated stationary tracking or constant-speed following.
+Right/down, all MPC weights, force-rate limits, PID, and vision settings remain
+unchanged.
+
+The water run `experimental_auto_20260814_235737.jsonl` rejected the `0.50`
+candidate based on both operator observation and the stationary ending. Over
+the last ten seconds, forward error RMS/P95 remained `9.67/15.59 cm`, while
+`10.5%` of forward commands were saturated. Across the full trace, `56.8%`
+of eligible base updates reached `0.50 N` and forward base lag P50/P95/max was
+`0.130/1.764/3.286 N`. The operator judged tracking worse than `0.40`, so the
+active forward limit is restored to `0.40 N/update`. No other parameter is
+changed.
+
+The next water run must again begin with an explicitly announced stationary
+10 s interval before one slow constant-speed pass and stop. Compare base lag,
+static hold, cruise error, and stopping overshoot against this trace.
+
+## 2026-08-14: moderate forward force-change smoothing after Q=800 run
+
+The translation-only run `experimental_auto_20260814_225507.jsonl` tested
+`Q_forward=800` with `R_force,forward=0.25`. Synchronized overhead data showed
+that during positive motion at approximately `0.05--0.056 m/s`, the vehicle
+reached approximately `0.058--0.061 m/s` and forward MAE was approximately
+`2.27--3.36 cm`. The preceding stationary interval had forward MAE/P95 of
+approximately `2.19/4.11 cm`. The higher position weight therefore materially
+reduced constant-speed lag without immediately losing stationary hold.
+
+The reverse interval still produced a five-second forward MAE/P95 of
+approximately `10.88/17.75 cm`, with the forward channel at its `20%` cap in
+approximately `19%` of that window. The operator also observed excessive
+speed variation. Frozen QP replay of the complete trace compared forward
+delta-force weights `4/6/8`: mean absolute first-step force change was
+`0.331/0.287/0.257 N`, and use of the `0.8 N` per-step limit was
+`13.6/9.1/7.0%`. The `8` candidate also reduced the P95 second-step force
+change from `0.800 N` to `0.656 N`, creating a larger risk of delayed reversal
+braking.
+
+The water run `experimental_auto_20260814_230123.jsonl` rejected the `6.0`
+candidate. Although its first settled stationary window briefly reached about
+`1.5--1.7 cm` forward MAE, after target motion the nominally stationary target
+produced repeated low-frequency chase cycles. Five-second windows reached
+approximately `20--54 cm` forward P95 while forward model-1 weight rose to
+about `0.62--0.82`; the latched forward base retained approximately
+`-2.5--+1.4 N` from the motion phase. Increasing the change penalty delayed
+unloading/reversal of this stale operating force and did not solve speed
+variation. The forward delta-force weight is therefore restored to `4.0`.
+Do not repeat `6.0` or increase it to `8.0` for this symptom. Position,
+velocity, and force weights remain `800/150/0.25`, horizon remains `10`, and
+fusion, limits, PID, and vision remain unchanged. The next controller change
+must address model-1 operating-force credibility during stopping, preferably
+by suppressing model 1 when the achieved-force baseline is varying or
+reversing while preserving it under a stable cruise force.
+
+This run also ended with `armed command confirmation stale`, the second such
+event during a visual-result gap. Both post-stop disarmed link checks showed
+fresh telemetry, accepted zero commands, state `IDLE`, armed false, and zero
+motor outputs. Do not weaken the `0.25 s` confirmation guard; reduce host-side
+load/output backpressure and retain the safety stop before another armed run.
+
+## 2026-08-14: raise forward position weight after R=0.25 water test
+
+The translation-only run `experimental_auto_20260814_224318.jsonl` tested the
+preceding single change `R_force,forward=0.25`. The synchronized overhead bag
+`top_camera_20260814_224228` showed that slow positive motion had forward MAE
+`1.79 cm`, and a stationary interval had MAE/P95 `1.08/2.32 cm`; static hold
+therefore remained good. At approximately `0.11--0.12 m/s` target speed,
+however, two fast constant-direction intervals still had signed forward error
+of approximately `+9.14 cm` and `-10.84 cm`. Lowering only the force penalty
+was therefore insufficient to meet the requested `5 cm` cruise-error target.
+
+Across the full run, the forward channel reached its `20%` cap in only `2.5%`
+of control updates, the maximum final motor magnitude was `0.335`, and no
+motor approached the `0.50` final cap. A frozen QP replay of the same logged
+states with the already-active `R_force,forward=0.25` raised first-step
+forward `0.8 N` delta-force-bound use from `10.6%` at `Q_forward=500` to
+`14.1%` at `Q_forward=800`; force-bound use rose only from `1.2%` to `2.1%`.
+Only `position_weights[forward]` is therefore changed from `500` to `800`.
+Forward velocity/force/delta-force weights remain `150/0.25/4.0`, horizon
+remains `10`, and fusion, limits, PID, and vision remain unchanged. The next
+run must again check stationary hold first, then slow and fast straight
+forward/reverse passes, with special attention to reversal overshoot.
+
+The same run ended with the independent safety fault `armed command
+confirmation stale` after a visual-quality gap. The subsequent disarmed link
+test confirmed state `IDLE`, armed false, zero requested/received channels,
+zero applied motor outputs, no failsafe, and no command rejection. This was
+not a QP failure and does not justify weakening the `0.25 s` command
+confirmation safety limit.
+
+## 2026-08-14: lower forward equilibrium-relative force penalty
+
+After rejecting the frozen high model-1 weight experiment, the adaptive
+fusion threshold was restored to `1e-7 m^2`. Steady-state QP solves were then
+performed for forward model-1 weights `0.20/0.35/0.50` and latched bases
+`1.0/1.5/2.0 N`. With the current `Q_forward=500` and `R_force,forward=0.50`,
+the representative `a1=0.35`, `tau_base=1.5 N` equilibrium required
+approximately `7.92 cm` position error before the MPC requested the full base.
+This matches the measured fast constant-speed lag.
+
+Raising `Q_forward` to `800` reduced that calculated offset to `5.31 cm`;
+lowering only `R_force,forward` to `0.25` produced a comparable `5.48 cm`.
+Frozen replay over `experimental_auto_20260814_215909.jsonl` showed the Q=800
+candidate increasing first-step `0.8 N` delta-force-bound use from `5.8%` to
+`9.3%`, while the R=0.25 candidate increased it only to `6.2%`. Force/channel
+cap fractions were similar (`5.3%` versus `5.2%`). Therefore only the forward
+force weight changes from `0.50` to `0.25`. Forward position/velocity weights
+remain `500/150`, delta-force weight remains `4.0`, horizon remains `10`, and
+fusion, limits, PID, and vision remain unchanged. The next water run must
+first verify a stationary target, then compare slow and fast constant-speed
+errors and reversal overshoot.
+
+## 2026-08-14: forward fusion identifiability threshold after variable-speed passes
+
+The translation-only run `experimental_auto_20260814_215909.jsonl`, aligned
+with overhead bag `top_camera_20260814_215826`, contained repeated slow and
+fast forward/reverse passes. Long passes near `0.05 m/s` had mean absolute
+forward error of approximately `3.6--4.2 cm`, while passes near
+`0.10--0.13 m/s` rose to approximately `7.8--9.8 cm`. The vehicle and target
+mean speeds were already close in those fast passes, but the forward model-1
+weight remained only about `0.34--0.42`.
+
+At fast steady speed, the latched forward base was commonly `1.6--1.8 N`, the
+fused equilibrium reference was only `1.1--1.2 N`, and requested force was
+only `0.01--0.06 N` beyond the latched base. The controller therefore matched
+speed without producing enough excess force to close the accumulated
+`7--9 cm` error promptly. Forward channel saturation occurred in only about
+`6--17%` of the selected fast-pass samples and final motor throttle peaked at
+`0.409`, so the final motor limit was not the primary cause.
+
+The logged forward candidate-separation score corresponded to only about
+`0.94 mm RMS` on average and `3.21 mm` at P95, versus the configured forward
+position measurement standard deviation of `30 mm`. The previous forward
+indistinguishability threshold, `1e-7 m^2` (`0.316 mm RMS`), allowed the fusion
+weight to react to candidate differences far below measurement noise. Frozen
+replays with fusion horizons 5 and 8 did not make model 1 consistently more
+identifiable. Only the forward `indistinguishable_score_threshold` is changed
+from `1e-7` to `1e-4 m^2` (`10 mm RMS`) for one explicit A/B test. This
+deliberately preserved the existing `0.80` forward model-1 prior when the
+candidates lacked meaningful separation; right/down thresholds, MPC costs,
+horizon, limits, PID, and vision remained unchanged.
+
+The A/B run `experimental_auto_20260814_221332.jsonl` rejected this change.
+With the target held approximately stationary, the forward model-1 weight
+remained exactly `0.80`; forward error swung over approximately
+`-28.6--+32.0 cm`, mean absolute error rose to `12.9 cm`, and the forward
+channel hit its `20%` limit in `81/344` updates. The operator directly observed
+that the controller could no longer track even the stationary target. Holding
+the previous achieved force as a high-weight equilibrium therefore retains
+too much force during stopping and creates a chase/overshoot/reversal cycle.
+The forward threshold was immediately restored to `1e-7 m^2`. Do not repeat
+the `1e-4` threshold experiment; the next iteration must reduce the model-1
+operating-force memory during stopping rather than freezing model 1 at a high
+weight.
+
+## 2026-08-14: forward zero-crossing damping after equilibrium-relative force cost
+
+The translation-only run `experimental_auto_20260814_214726.jsonl`, aligned
+with overhead bag `top_camera_20260814_214614`, contained three approximately
+constant-speed forward/reverse intervals. The overhead target moved at
+`0.063--0.074 m/s` while the vehicle moved at `0.057--0.066 m/s`. Signed
+steady forward error was approximately `4.3 cm`, `5.4 cm`, and `0.4 cm`, a
+large improvement over the earlier roughly `20 cm` lag after centering the
+force cost on the fused equilibrium. The operator nevertheless observed
+excess zero-crossing overshoot and requested at most `5 cm` error during
+constant-speed motion.
+
+Only the forward velocity weight was changed from `100` to `150`. Forward
+position weight remains `500`, forward force/delta-force weights remain
+`0.5/4.0`, and horizon remains `10`. This adds damping to relative forward
+velocity without moving the zero-error equilibrium or simultaneously changing
+the force slew penalty. No firmware or vision change is required.
+
 ## 2026-08-06: faster fish tracking
 
 The Unity integration uses symmetric positive and negative limits. No
@@ -456,3 +859,323 @@ settled P95 was `0.01032 m`, solver success was `100%`, and the exact
 per-thruster horizontal envelope was active for `23.1%` of samples. A
 `0.10 m/s` run with the same final weights reached matched P95 `0.03205 m`,
 so `0.0975 m/s` is the highest confirmed speed under these limits.
+
+## 2026-08-13--14: real-device 0.6 m reference and structural tuning audit
+
+The real-device camera reference is now body FRD
+`[0.857634,-0.055545,-0.120815] m`, corresponding to `0.6 m` along the
+onboard camera optical axis. Six weight/rate trials were collected. Lowering
+the sway position weight from `700` to `350` reduced command magnitude but did
+not remove opposite-side overshoot. Lowering only the sway delta-force cost
+from `2.0` to `0.5` improved the two observed sway reversals from roughly
+`44--45%` overshoot to about `22--32%`. Lowering the surge delta-force cost to
+`0.5` produced about `84%` surge overshoot and was rejected. The current surge
+delta-force cost `4.0` has not yet received a clean excitation test.
+
+The follow-up audit found that weight-only tuning is premature:
+
+- `N=5` spans only `0.5 s`, versus model `M/D` time constants of
+  `1.755--2.588 s` and measured RPM spin-down tails up to about `0.8 s`;
+- `5.0--7.5%` of accepted update intervals exceeded `0.15 s`, while the
+  estimator always advances one fixed `0.10 s` step;
+- the replayed learned horizontal baseline reached ranges of approximately
+  `1.5--2.4 N` and can persist when a hand-moved target stops;
+- the final `0.50` motor cap was never reached, but mixed-channel distortion
+  above `0.005` occurred in `23--62%` of updates;
+- the `0.01` software motor deadband corresponds to a yaw P-only angular
+  threshold of about `1.53 deg` with the selected lower PID;
+- RPM-curve and command-linear achieved-force estimates differed by roughly
+  `0.44--1.21 N` at P95, so both must be logged before selecting the feedback
+  source.
+
+In the deterministic current-model benchmark, diagonal-step overshoot for
+`N=5/10/15/20/25` was approximately `8.8/11.9/6.8/3.8/2.8%`, while P95 solve
+time was `2.1/2.9/4.2/5.3/7.3 ms`. Longer horizons also requested more force,
+and a noisy delayed/dropout simulation showed that an aggressive `N=20`
+candidate is unsafe to select before fixing the time base. The first post-fix
+real-device candidate is therefore a damped `N=15` bundle, not an immediate
+configuration change. Full parameter inventory, symptom routing, candidate
+values and test order are in `REAL_DEVICE_TUNING_GUIDE.md`; reproducible audit
+output is `calibration_logs/offline_tuning_audit_20260814.analysis.json`.
+
+## 2026-08-14: corrected fixed-per-solve base implementation
+
+The earlier slow-horizontal-disturbance interpretation of `tau_base` was
+wrong, but the first audit correction then made a second mistake: it claimed
+that model 1 must replace its base with the preceding planned force at every
+future horizon step. The confirmed PDF semantics are instead:
+
+```text
+tau_base,k = tau_achieved,k-1
+v1[j+1] = F v1[j] + G (tau[j] - tau_base,k)
+```
+
+`tau_base,k` is fixed for the complete solve that starts at `k`; the next solve
+latches a new achieved force. Consecutive planned forces still roll for the
+separate rate cost and constraint, `Delta tau[j]=tau[j]-tau[j-1]`, but they do
+not replace model 1's fixed origin.
+
+The active dual implementation now follows that definition. The old
+`gated_ema` path has been removed from active tracking, fixed
+`tau_h=h(0)=[0,0,0.807290] N` is stored separately, and model 2 uses
+`v2+=Fv+G(tau-tau_h)`. Kalman mean prediction, historical model scoring and
+the QP use the same two candidates. The QP cost is absolute total force plus
+consecutive force change, PDF position propagation uses the end-of-step
+relative velocity, indistinguishable fusion evidence holds the previous
+weight, and solver/vision-gap fallback returns toward `tau_h`. The earlier
+recommendation to disable horizontal baseline remains withdrawn.
+
+Remaining structural gaps at that checkpoint were fixed versus actual visual
+`dt`, actuator delay/inertia, command-derived achieved force, active-yaw frame
+rotation, camera-coordinate FOV constraints, and the experimental identity
+thruster envelope. See `MODEL_PDF_IMPLEMENTATION_AUDIT.md`.
+
+## 2026-08-14: RPM achieved force, yaw-frame prediction, and camera constraints
+
+The active formal/experimental AUTO adapter now reconstructs achieved force
+and yaw moment from signed DSHOT RPM using the accepted same-vehicle
+positive/negative quadratic curves and CAD force geometry. Horizontal
+M1/M2/M6/M7 and vertical M3/M4/M5/M8 valid bits are gated independently; an
+incomplete group falls back only that group's final applied motor set-points.
+Per-thruster curve limits clamp invalid RPM magnitude excursions, and the
+trace records the selected source and each reconstructed thruster force.
+
+Between visual updates, the estimator and every pending fusion prediction now
+rotate old body coordinates by the measured telemetry yaw increment. Inside
+the QP horizon, each step rotates coordinates using the current body-FRD yaw
+rate under a constant-rate assumption. The raw H30 telemetry rate sign is
+converted to the same FRD convention already used by `V5_SUB`.
+
+FOV and range constraints now subtract the body-frame camera origin and apply
+the active camera rotation before constraining
+`[camera-forward,camera-right,camera-down]`. The experimental `I3` thruster
+constraint is intentionally documented but not changed in this revision: it
+duplicates the three translation-axis boxes and still omits actuator sharing
+with local yaw and roll/pitch PID.
+
+## 2026-08-14: RPM achieved-force control rollback after water test
+
+The first post-change water run accepted only two visual updates. A preceding
+`+0.0223` forward / `+0.0327` right channel was reconstructed from
+instantaneous RPM as `+1.138 N` forward / `+3.097 N` right, and the next MPC
+request increased to `+0.0563/+0.0954`. The target then crossed the configured
+forward-range gate and the later QP became primal infeasible while using the
+RPM force as both fixed model-1 base and hard slew reference.
+
+RPM is therefore diagnostic-only again. Active `tau_achieved` uses the final
+mixed motor-throttle echo, while the signed per-thruster and combined RPM
+force estimates remain in the trace for offline comparison. Yaw-frame
+rotation, camera-coordinate visibility constraints, fixed-per-solve
+`tau_base`, and the independent Fossen restoring force are unchanged.
+
+## 2026-08-14: throttle-feedback retry and experimental vision range
+
+The retry `experimental_auto_20260814_172803.jsonl` ran for about `292 s` and
+completed `1928/1928` QP updates with status `solved`; no solver fallback or
+final-motor cap occurred. Every control update used
+`applied_motor_throttle` for all three `tau_achieved` axes. Full RPM validity
+was `98.76%`, but the P95 absolute RPM-diagnostic minus throttle-derived force
+difference was approximately `[2.12,1.80,2.11] N`, confirming the rollback.
+Maximum tracker update time was `9.41 ms`, maximum motor magnitude was
+`0.1522`, and the largest QP slack was `0.01155`.
+
+The dominant interruption was the MPC-side visual distance gate: `612` of
+`733` held-armed vision gaps were `forward_range`. During the same run the
+read-only vision stream produced `542` target samples beyond the old
+`0.85 m` maximum. After the operator confirmed that the vehicle stopped
+following at long range and selected `1.4 m`, only
+`experimental_auto.vision_gate_overrides.forward_range_m[1]` was changed from
+`0.85` to `1.40 m`. The operator then selected a `0.30 m` experimental minimum
+instead of `0.35 m`; the controller camera-forward constraints remain
+`0.20--1.50 m`. NIS, depth-quality, motion-jump and reacquisition policies are
+unchanged. No vision code or lower firmware changed.
+
+## 2026-08-14: lateral-yaw A/B with yaw rate Kp 0.12
+
+The visible yaw oscillation during sway was isolated to the lower attitude
+loop/mixer before changing MPC speed or horizon. Only the lower yaw rate-loop
+Kp was reduced from `0.15` to `0.12`; Ki remained `0.00005` per 1 kHz cycle,
+Kd remained zero, the outer attitude gain remained `2.5`, and all MPC and
+vision settings were held fixed. The rebuilt firmware was verified after
+flashing, and the disarmed link checks before and after the run reported
+`IDLE`, `armed=0`, zero requested/applied channels, zero RPM, and no rejected
+commands.
+
+The accepted trace is `experimental_auto_20260814_182757.jsonl`. It contains
+`909/909` solved QP updates over `100.45 s`; median/P95/max tracker time was
+`4.94/8.62/11.08 ms`. All three achieved-force axes used final applied motor
+throttle, and all eight RPM bits were valid for `900/909` updates. There was no
+final `0.50` motor scaling. The whole-run maximum motor magnitude of `0.1924`
+and maximum slack of `0.4548` occurred during a later, deliberately excluded
+distance/position excursion at camera position approximately
+`[-0.43,0.14,1.34] m`, not during the clean lateral onset.
+
+In the clean outbound onset (`30--39 s` from the first active update), onboard
+camera x moved from about `+0.008 m` to a peak of `+0.089 m`; median camera
+forward distance was `0.589 m` with range `0.573--0.629 m`. The right channel
+peaked at `2.87%`. Absolute yaw rate median/P95/max was
+`1.56/8.50/12.31 deg/s`, and yaw spanned `1.91 deg`. The four horizontal
+motors made `68` zero/nonzero transitions in `8.85 s` (`7.69/s`), versus only
+`1.41/s` in the preceding static baseline; at least one horizontal motor was
+zero in `85.4%` of onset updates. Logged RPM shows that nonzero horizontal
+outputs just above the current `1%` hard cutoff normally jump directly to
+about `625--650 RPM`, confirming that the hard per-motor cutoff is a material
+source of the visible switching.
+
+Across the complete new trace, frames with `1--3%` absolute right request had
+yaw-rate P95/max `5.66/9.83 deg/s`, compared with `6.84/16.95 deg/s` in the
+preceding Kp `0.15` trace `experimental_auto_20260814_181604.jsonl`. For right
+requests at or above `3%`, P95/max changed from `5.14/7.63` to
+`2.87/9.25 deg/s`; the isolated valid return segment had P95/max
+`5.08/7.14 deg/s`. Thus Kp `0.12` reduces the sustained/high-percent yaw
+response but does not eliminate the onset chatter. Keep `0.12` provisionally;
+the next single change should address horizontal-motor deadband switching,
+not MPC translation weights. Only after that A/B should lateral speed or
+horizon be changed.
+
+The overhead camera was used only as auxiliary planar evidence. It confirmed
+that the target motion was predominantly lateral relative to vehicle heading,
+but its mapped displacement was roughly `0.4 m`, much larger than requested,
+and vehicle-tag detections were sparse. Its underwater pose/yaw and apparent
+depth are therefore not used as controller truth or as quantitative yaw
+ground truth.
+
+## 2026-08-14: model-1 equilibrium-relative force cost after forward H10 test
+
+The translation-only trace `experimental_auto_20260814_205217.jsonl` used
+`horizon=10`, `terminal_weight_scale=2`, and forward position/velocity/force/
+delta-force weights `500/100/0.5/4.0`. The synchronized overhead bag
+`top_camera_20260814_205217` independently observed target Tag 17 and vehicle
+Tags 15/16. Its target forward-speed P95/maximum was approximately
+`0.170/0.313 m/s`, versus `0.105/0.149 m/s` in the preceding H5 run, confirming
+that the operator moved the target materially faster.
+
+During repeated forward/reverse intervals, overhead target and vehicle mean
+forward speeds were nevertheless close while the onboard forward error stayed
+about `7--20 cm` in the direction of motion. The corresponding achieved-force
+base was commonly `1--2.5 N`. A zero-relative-speed equilibrium solve with the
+then-active absolute-force cost predicted forward offsets of `5.8/8.7/11.6/
+14.4 cm` for `tau_base=1.0/1.5/2.0/2.5 N`, matching the observed lag. Increasing
+only `position_weights[forward]` from `500` to `800` reduced the predicted
+offset but did not remove it and increased requested correction; larger values
+reached the `0.8 N/update` delta-force bound in recorded-state replay.
+
+The operator clarified that model 1 is specifically intended to remove
+constant-speed following lag. The effort reference was therefore changed from
+zero absolute force to the fused zero-effective-input force:
+
+```text
+tau_eq,k = A1 tau_base,k + (I-A1) tau_h
+J_force = sum_j (tau[j]-tau_eq,k)^T R (tau[j]-tau_eq,k)
+```
+
+The state equations, fixed-per-solve base, Fossen restoring force, absolute
+force bounds, adjacent-force cost/limits, and fallback are unchanged. Offline
+pure-model-1 solves now hold a nonzero base at zero position/velocity error;
+the terminal forward error was below `0.02 cm` for `1--2.5 N` bases. The trace
+now records `mpc_force_reference_frd_n`. No lower-controller firmware or vision
+code changed. The next water test must keep `Q_forward=500` and the existing
+fusion parameters fixed so this cost change is evaluated by itself.
+
+## 2026-08-15: single-model-2 baseline versus adaptive fusion
+
+The single-model-2 baseline trace `experimental_auto_20260815_163804.jsonl`
+ran for about `111.5 s` with `fixed_model1_weight=[0,0,0]`. The subsequent
+adaptive-fusion trace `experimental_auto_20260815_164204.jsonl` ran for about
+`99.2 s` using the same vision source and MPC weights after removing the fixed
+override. No firmware or vision code changed between the runs.
+
+| Axis | Model 2 MAE/P95 | Fusion MAE/P95 | Fusion command saturation |
+|---|---:|---:|---:|
+| forward | `3.84/10.82 cm` | `7.56/22.18 cm` | `6.14%` |
+| right | `2.41/5.65 cm` | `2.28/6.68 cm` | `0.23%` |
+| down | `2.62/5.72 cm` | `2.64/9.46 cm` | `0.57%` |
+
+Fusion forward weight had median `0.011` but P90 `0.862`, showing intermittent
+model-1 excursions rather than a stable preference. The window filter itself
+was active: median valid/rejected windows were `5/1` forward, `1/4` right and
+`3/3` down. This run does not justify enabling the fusion setting unchanged
+for forward control; the next offline candidate should reduce the weight
+update rate (for example `0.35 -> 0.10`) while keeping the window rule,
+threshold and MPC weights fixed.
+
+## 2026-08-15: offline longer fusion prediction window candidate
+
+The offline replay of five overhead-camera-paired traces compared the current
+effective H2 history with completed H5 and H8 histories.  Forward candidate
+separation in steady cruise increased from `0.803 mm` (P50) for the current
+history to `2.835 mm` for H5 and `5.888 mm` for H8.  However, the fraction of
+steady-cruise samples where model 1 had lower candidate MSE remained
+`39.9%/39.3%/41.0%` for H2/H5/H8.  Longer history improves numerical
+separation but does not by itself identify the better model.
+
+The active experimental fusion block is therefore staged at the tested H5
+candidate: `window=8`, `prediction_horizon=5`, unit prediction-step weights,
+and staircase caps `[5,5,5,5,5,4,3,1]`.  This is an offline-selected
+configuration only; no H5 hardware run has been started yet.
+
+The H5 water run `experimental_auto_20260815_165500.jsonl` was then performed
+with the same vision source and unchanged MPC costs. It ran for about `101.8 s`
+and was operator-stopped after a vision gap. Forward/right/down MAE/P95 were
+`8.45/21.8`, `4.24/13.79`, and `3.24/8.73 cm`; forward command saturation was
+`10.82%`. The model-1 weight P90 reached `0.975/0.989/0.990` for the three
+axes even though the medians stayed near `0.01`. The longer window therefore
+increased candidate separation but amplified intermittent model-1 excursions;
+H5/window8 is rejected for the next run. Return to the safer single-model-2
+baseline or reduce the fusion update rate offline before another fusion test.
+
+Following that result, only `weight_update_rate` was staged from `0.35` to
+`0.10`; the long `H=5/window=8` history was intentionally left unchanged.
+No new hardware run has been started with this rate yet.
+
+The adaptive fusion preset was then changed to `initial_model1_weight=[0,0,0]`
+while retaining `minimum_weight=0.01` and `fixed_model1_weight=null`. Thus the
+runtime starts at the protected floor `0.01` on each axis and can still adapt;
+it is not a permanent model-2 override.
+
+## 2026-08-15: forward matched-motion baseline gate staged offline
+
+The preceding gated EMA improved static holding but remained eligible on only
+about `9%` of the dynamic forward samples in
+`experimental_auto_20260815_175801.jsonl`, because it required
+`|v_forward| <= 0.08 m/s`.  The active experimental configuration now adds a
+separate forward-only gate: `|v|=0.05--0.20 m/s`, estimated acceleration at most
+`0.20 m/s²`, and three consecutive same-sign confirmations.  Once confirmed it
+uses the existing transient EMA rate `alpha=0.03`; static updates remain at
+`alpha=0.01/0.03` under the original position/velocity gates.  Any sign change,
+acceleration outside the bound, or position error above `0.20 m` resets the
+dynamic confirmation streak and freezes the base.  Right/down and all MPC,
+fusion, vision, firmware, and actuator settings are unchanged.  This is an
+offline code/config change only; no hardware run has started with it.
+
+The operator rejected the extra matched-motion threshold because freezing during
+acceleration, reversal, or large error would further weaken dynamic following.
+The active preset therefore disables `matched_motion_axis_enabled` and returns
+to one position/velocity gated EMA on all axes, with a moderate speed-up from
+`alpha=0.01/0.03` to `alpha=0.02/0.08` and the broad velocity gate widened from
+`0.08` to `0.20 m/s`.  The `0.20 m` position gate is unchanged.  This change is
+upper-controller configuration only; no hardware run has started with it.
+
+## 2026-08-15: H15 fusion run — visual endpoint exclusion and high-speed model check
+
+The H15 upper-controller run is recorded in
+`calibration_logs/experimental_auto_20260815_205021.jsonl`. The raw trace is
+preserved. The second forward-run endpoint contains a visual depth/body-forward
+jump: frames `84235--84424` move from the preceding approximately
+`0.66/0.92 m` state to approximately `0.80--1.09/0.97--1.37 m` and then
+return. That interval is excluded from offline error and model-selection
+statistics only; the exclusion record is
+`calibration_logs/experimental_auto_20260815_205021.analysis.json`.
+
+After that exclusion, estimated FRD error MAE/P95 are
+`3.44/10.87 cm` forward, `1.70/4.89 cm` right, and `1.68/3.89 cm` down.
+The remaining larger forward peak is from other portions of the run and is not
+automatically discarded. No raw JSONL rows were deleted.
+
+In the final high-speed segment, frames `84880--84907` kept forward model-1
+weight near `0.99` because its candidate MSE was lower. After the subsequent
+velocity sign change, frames `84910--84940` reduced the weight to a median of
+`0.053` (P90 `0.364`) while model 2 had lower candidate MSE. Thus the fusion
+selector did distinguish this transition; the near-zero-acceleration plateau
+itself still favored model 1. MPC was stopped by operator request; the vision
+window and live error plot remain running.

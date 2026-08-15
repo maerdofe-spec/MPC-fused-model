@@ -57,9 +57,12 @@ class MPCTracker:
         self.thruster_allocator = thruster_allocator
 
     def latch_baseline(self, tau_achieved) -> None:
-        """Capture a safe hold force when automatic tracking is enabled."""
-        achieved = vector3(tau_achieved, "tau_achieved")
-        self.model.set_tau_base(achieved)
+        """Reset optimizer history when automatic tracking is enabled.
+
+        Model 2 has no matched-force baseline to latch.  The argument remains
+        for compatibility with the other tracker API and is intentionally
+        ignored.
+        """
         self.controller.reset()
 
     def target_lost(self, tau_achieved_previous) -> SafeControlOutput:

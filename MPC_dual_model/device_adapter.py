@@ -43,9 +43,11 @@ FINESUB_V4_PRO1_FORCE_NEGATIVE_N = (
     7.9750,
 )
 
-# Calibrated UnderwaterVision geometry in the UUV Rigidbody body frame.
-# Unity uses x/y/z = forward/up/right. Positive thruster force follows the
-# normalized local force direction. The order is FINESUB_CANONICAL_THRUSTERS.
+# Geometry imported from the calibrated UnderwaterVision Unity prefab.  It is
+# a simulation/CAD prior, not a measurement of the current real vehicle.  Do
+# not use it to enable real-vehicle attitude allocation until the motor centres,
+# force axes and centre of mass have been measured in the common FRD frame.
+# The order is FINESUB_CANONICAL_THRUSTERS.
 FINESUB_UNITY_THRUSTER_POSITIONS_BODY_M = np.array(
     [
         [0.08312216, -0.030930428, 0.13304673],

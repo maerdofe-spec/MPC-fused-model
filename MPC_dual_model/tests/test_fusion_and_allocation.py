@@ -55,8 +55,25 @@ class FusionAndAllocationTest(unittest.TestCase):
             horizon_step=1,
         )
         # A 0.1 mm candidate difference is below the configured score floor;
-        # neutral evidence recovers toward the model-1 steady-state prior.
-        np.testing.assert_allclose(weight, (0.99, 0.99, 0.99))
+        # neutral evidence leaves the preceding model preference unchanged.
+        np.testing.assert_allclose(weight, (0.8, 0.8, 0.8))
+
+    def test_fixed_model2_override_holds_zero_model1_weight(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                fixed_model1_weight=(0.0, 0.0, 0.0),
+                initial_model1_weight=(0.8, 0.8, 0.8),
+                minimum_weight=0.01,
+            )
+        )
+        self.assertEqual(fusion.model1_weight.tolist(), [0.0, 0.0, 0.0])
+        weight = fusion.observe_position(
+            actual_position=(0.0, 0.0, 0.0),
+            prediction1=(0.0, 0.0, 0.0),
+            prediction2=(0.5, -0.4, 0.3),
+            horizon_step=1,
+        )
+        np.testing.assert_allclose(weight, (0.0, 0.0, 0.0))
 
     def test_position_history_keeps_completed_multi_step_scores(self) -> None:
         fusion = OnlineModelFusion(
@@ -78,9 +95,9 @@ class FusionAndAllocationTest(unittest.TestCase):
         # Only x differs between the two candidate predictions.  Identical
         # y/z candidates are intentionally neutral rather than favouring one.
         self.assertGreater(fusion.model1_weight[0], fusion.model2_weight[0])
-        # Identical candidates use the model-1 steady-state prior rather than
-        # drifting toward an arbitrary 50/50 split.
-        np.testing.assert_allclose(fusion.model1_weight[1:], (0.95, 0.95))
+        # Identical candidates preserve the prior rather than inventing a
+        # model-1 observation or drifting toward an arbitrary 50/50 split.
+        np.testing.assert_allclose(fusion.model1_weight[1:], (0.8, 0.8))
 
     def test_default_staircase_can_reach_ninety_nine_percent_model1(self) -> None:
         fusion = OnlineModelFusion(
@@ -124,7 +141,77 @@ class FusionAndAllocationTest(unittest.TestCase):
         self.assertEqual(fusion.sample_count, 2)
         self.assertGreater(fusion.model1_weight[0], fusion.model2_weight[0])
 
-    def test_augmented_prediction_has_model1_baseline_offset(self) -> None:
+    def test_staircase_rejects_only_ambiguous_prediction_window(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                window=3,
+                prediction_horizon=3,
+                staircase_horizon_caps=(3, 3, 3),
+                indistinguishable_score_threshold=(1.0e-4, 1.0e-4, 1.0e-4),
+                initial_model1_weight=(0.5, 0.5, 0.5),
+                minimum_weight=0.01,
+            )
+        )
+        # Origin 0 has only a 1 mm candidate gap and is rejected as one
+        # complete window. Origin 1 has a 100 mm gap and remains usable.
+        for target in (1, 2, 3):
+            fusion.observe_position(
+                actual_position=(0.0, 0.0, 0.0),
+                prediction1=(0.0, 0.0, 0.0),
+                prediction2=(0.001, 0.001, 0.001),
+                horizon_step=target,
+                origin_index=0,
+                target_index=target,
+            )
+        for target in (2, 3):
+            fusion.observe_position(
+                actual_position=(0.0, 0.0, 0.0),
+                prediction1=(0.0, 0.0, 0.0),
+                prediction2=(0.1, 0.1, 0.1),
+                horizon_step=target - 1,
+                origin_index=1,
+                target_index=target,
+            )
+        fusion.advance_time(3)
+        np.testing.assert_array_equal(fusion.window_valid_count, (1, 1, 1))
+        np.testing.assert_array_equal(fusion.window_rejected_count, (1, 1, 1))
+        self.assertGreater(fusion.model1_weight[0], fusion.model2_weight[0])
+
+    def test_six_windows_one_rejected_uses_other_five(self) -> None:
+        fusion = OnlineModelFusion(
+            FusionConfig(
+                window=6,
+                prediction_horizon=3,
+                prediction_horizon_weights=(1.0, 1.0, 1.0),
+                staircase_horizon_caps=(3, 3, 3, 3, 3, 3),
+                forgetting_factor=1.0,
+                indistinguishable_score_threshold=(1.0e-4,) * 3,
+                initial_model1_weight=(0.5,) * 3,
+                minimum_weight=0.01,
+            )
+        )
+        # Feed a rolling stream. At frame 7 the six retained origins are
+        # 1..6. Origin 6 has only a one-step ambiguous candidate gap; the
+        # other five origins have three clear steps each.
+        for target in range(8):
+            for origin in range(max(0, target - 3), target):
+                horizon = target - origin
+                candidate2 = 0.001 if origin == 6 else 0.1
+                fusion.observe_position(
+                    actual_position=(0.0, 0.0, 0.0),
+                    prediction1=(0.0, 0.0, 0.0),
+                    prediction2=(candidate2, candidate2, candidate2),
+                    horizon_step=horizon,
+                    origin_index=origin,
+                    target_index=target,
+                )
+        np.testing.assert_array_equal(fusion.window_valid_count, (5, 5, 5))
+        np.testing.assert_array_equal(fusion.window_rejected_count, (1, 1, 1))
+        # Only the five clear windows enter the aggregate: M1=0 and M2=0.01.
+        np.testing.assert_allclose(fusion.M1, (0.0, 0.0, 0.0), atol=1.0e-12)
+        np.testing.assert_allclose(fusion.M2, (0.01, 0.01, 0.01), atol=1.0e-12)
+
+    def test_model1_keeps_same_base_through_complete_horizon(self) -> None:
         model = FixedLinearDampingRelativeModel(
             np.diag([20.0, 25.0, 30.0]),
             np.diag([8.0, 10.0, 12.0]),
@@ -133,38 +220,41 @@ class FusionAndAllocationTest(unittest.TestCase):
         controller = RelativeMPCController(model, MPCConfig(horizon=2))
         z0 = np.concatenate((np.zeros(6), np.array([2.0, 0.0, 0.0])))
         baseline = np.array([2.0, 0.0, 0.0])
+        increment = np.array([1.0, 0.0, 0.0])
+        commands = np.tile(baseline + increment, 2)
         controller._build_prediction_matrices(np.ones(3))
-        model1_free = (
+        predicted = (
             controller.Sx @ z0 + controller.baseline_effect_matrix @ baseline
-        ).reshape(2, 6)[0]
-        controller._build_prediction_matrices(np.zeros(3))
-        model2_free = (
-            controller.Sx @ z0 + controller.baseline_effect_matrix @ baseline
-        ).reshape(2, 6)[0]
-        np.testing.assert_allclose(model1_free, -model.B_d @ [2.0, 0.0, 0.0])
-        np.testing.assert_allclose(model2_free, np.zeros(6))
+            + controller.restoring_effect_matrix @ model.restoring_force
+            + controller.Su @ commands
+        ).reshape(2, 6)
+        first = model.B_d @ increment
+        second = model.A_d @ first + model.B_d @ increment
+        np.testing.assert_allclose(predicted[0], first, atol=1e-12)
+        np.testing.assert_allclose(predicted[1], second, atol=1e-12)
 
-    def test_model2_uses_absolute_force_without_tau_base(self) -> None:
+    def test_model2_subtracts_tau_h_and_ignores_model1_base(self) -> None:
+        restoring = np.array([0.0, 0.0, 0.80729])
         model = FixedLinearDampingRelativeModel(
             np.diag([26.0, 27.0, 26.0]),
             np.diag([94.0, 144.0, 281.0]),
             0.05,
+            restoring_force=restoring,
         )
         controller = RelativeMPCController(model, MPCConfig(horizon=3))
         baseline = np.array([11.25, -2.0, 1.9])
-        augmented = np.concatenate((np.zeros(6), np.zeros(3)))
-        commands = np.tile(baseline, controller.config.horizon)
+        augmented = np.concatenate((np.zeros(6), baseline))
+        commands = np.tile(restoring, controller.config.horizon)
 
         controller._build_prediction_matrices((0.0, 0.0, 0.0))
-        predicted = (controller.Sx @ augmented + controller.Su @ commands).reshape(
-            controller.config.horizon, 6
-        )
+        predicted = (
+            controller.Sx @ augmented
+            + controller.baseline_effect_matrix @ baseline
+            + controller.restoring_effect_matrix @ restoring
+            + controller.Su @ commands
+        ).reshape(controller.config.horizon, 6)
 
-        np.testing.assert_allclose(
-            predicted[0],
-            model.A_d @ np.zeros(6) + model.B_d @ baseline,
-            atol=1e-12,
-        )
+        np.testing.assert_allclose(predicted, np.zeros((3, 6)), atol=1e-12)
 
     def test_diagonal_horizontal_force_hits_joint_thruster_limit(self) -> None:
         from device_adapter import (
@@ -198,7 +288,7 @@ class FusionAndAllocationTest(unittest.TestCase):
             expected_signs,
         )
 
-    def test_effective_force_cost_matches_each_candidate_model(self) -> None:
+    def test_force_cost_penalizes_absolute_total_force(self) -> None:
         model = FixedLinearDampingRelativeModel(
             np.diag([20.0, 25.0, 30.0]),
             np.diag([8.0, 10.0, 12.0]),
@@ -206,14 +296,50 @@ class FusionAndAllocationTest(unittest.TestCase):
         )
         controller = RelativeMPCController(model, MPCConfig(horizon=3))
 
-        controller._build_prediction_matrices(np.ones(3))
-        np.testing.assert_allclose(controller.effective_force_matrix, np.eye(9))
-
-        controller._build_prediction_matrices(np.zeros(3))
-        np.testing.assert_allclose(
-            controller.effective_force_matrix,
-            np.eye(9),
+        free = np.zeros(18)
+        reference = np.zeros(3)
+        previous = np.array([2.0, -1.0, 0.5])
+        equilibrium = np.array([1.5, -0.25, 0.2])
+        zero = np.zeros(3)
+        P_with_reference, q_with_reference = controller._cost(
+            free, reference, previous, equilibrium
         )
+        P_without_reference, q_without_reference = controller._cost(
+            free, reference, previous, zero
+        )
+        # The fourth argument is retained only for compatibility with older
+        # callers; it no longer shifts the absolute-force penalty.
+        np.testing.assert_allclose(P_with_reference, P_without_reference, atol=1e-12)
+        np.testing.assert_allclose(q_with_reference, q_without_reference, atol=1e-12)
+
+    def test_pure_model1_zero_error_still_penalizes_nonzero_total_force(self) -> None:
+        restoring = np.array([0.0, 0.0, 0.80729])
+        model = FixedLinearDampingRelativeModel(
+            np.diag([24.82, 26.26, 26.26]),
+            np.diag([9.589, 14.96, 11.29]),
+            0.1,
+            restoring_force=restoring,
+        )
+        reference = np.array([0.857634, -0.055545, -0.120815])
+        controller = RelativeMPCController(
+            model,
+            MPCConfig(horizon=5, reference_position=reference),
+        )
+        baseline = np.array([2.0, -0.5, 0.80729])
+        state = np.concatenate((reference, np.zeros(3)))
+
+        result = controller.solve(
+            state,
+            baseline,
+            model1_weight=np.ones(3),
+        )
+
+        np.testing.assert_allclose(result.force_reference, np.zeros(3), atol=1e-12)
+        self.assertLess(np.linalg.norm(result.force), np.linalg.norm(baseline))
+        self.assertGreater(np.linalg.norm(result.force - baseline), 1.0e-2)
+        # The position remains close to the target, but the optimizer is now
+        # allowed to trade a small model-1 velocity error for lower total force.
+        self.assertLess(np.max(np.abs(result.predicted_states[:, :3] - reference)), 5.0e-3)
 
     def test_finesub_forward_mixer_and_motor_order(self) -> None:
         allocator = FineSUBThrusterAllocator(deadband=0.0)

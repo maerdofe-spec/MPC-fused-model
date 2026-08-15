@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 import numpy as np
 
 try:
+    from .camera_transform import rotation_state_body_from_previous
     from .dense_qp import QPSolverSettings, create_qp_solver
     from .fossen_fixed_dl_model import FixedLinearDampingRelativeModel, vector3
 except ImportError:
+    from camera_transform import rotation_state_body_from_previous
     from dense_qp import QPSolverSettings, create_qp_solver
     from fossen_fixed_dl_model import FixedLinearDampingRelativeModel, vector3
 
@@ -49,11 +51,16 @@ class MPCConfig:
     position_weights: object = (50.0, 100.0, 100.0)
     velocity_weights: object = (8.0, 12.0, 12.0)
     terminal_weight_scale: float = 4.0
-    # Penalizes the fused model's effective input:
-    # tau[k] - diag(a1) tau_base. It is relative-to-baseline force for model 1
-    # and absolute force for model 2, avoiding a bias against nonzero hold force.
+    # Absolute total propulsion effort. The separate delta-force term still
+    # penalizes consecutive planned physical-force changes.
     force_weights: object = (0.04, 0.06, 0.06)
     delta_force_weights: object = (0.8, 1.0, 1.0)
+
+    # Optional upper-computer actuator model. Disabled by default until an
+    # offline force/RPM replay validates the candidate delay.
+    actuator_model_enabled: bool = False
+    actuator_pure_delay_s: float = 0.0
+    actuator_time_constant_s: float = 0.0
 
     force_min: object = (-20.0, -15.0, -15.0)
     force_max: object = (20.0, 15.0, 15.0)
@@ -86,6 +93,15 @@ class MPCConfig:
     horizontal_axis: int = 1
     vertical_axis: int = 2
 
+    # Visibility constraints are expressed in the physical camera frame. The
+    # visibility frame order is [camera forward, camera right, camera down].
+    rotation_visibility_from_body: object = (
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    camera_origin_in_body: object = (0.0, 0.0, 0.0)
+
     solver_settings: QPSolverSettings = field(
         default_factory=lambda: QPSolverSettings(
             rho=10.0,
@@ -110,6 +126,24 @@ class MPCConfig:
         self.delta_force_weights = _positive_vector3(
             self.delta_force_weights, "delta_force_weights"
         )
+        if not isinstance(self.actuator_model_enabled, (bool, np.bool_)):
+            raise ValueError("actuator_model_enabled must be boolean")
+        if (
+            not np.isfinite(self.actuator_pure_delay_s)
+            or self.actuator_pure_delay_s < 0.0
+        ):
+            raise ValueError("actuator_pure_delay_s must be nonnegative and finite")
+        if (
+            not np.isfinite(self.actuator_time_constant_s)
+            or self.actuator_time_constant_s < 0.0
+        ):
+            raise ValueError(
+                "actuator_time_constant_s must be nonnegative and finite"
+            )
+        if self.actuator_model_enabled and self.actuator_time_constant_s <= 0.0:
+            raise ValueError(
+                "actuator_time_constant_s must be positive when actuator model is enabled"
+            )
         self.force_min = vector3(self.force_min, "force_min")
         self.force_max = vector3(self.force_max, "force_max")
         self.delta_force_min = vector3(self.delta_force_min, "delta_force_min")
@@ -168,6 +202,20 @@ class MPCConfig:
         axes = {self.forward_axis, self.horizontal_axis, self.vertical_axis}
         if axes != {0, 1, 2}:
             raise ValueError("forward/horizontal/vertical axes must be a permutation of 0,1,2")
+        rotation = np.asarray(self.rotation_visibility_from_body, dtype=float)
+        origin = np.asarray(self.camera_origin_in_body, dtype=float).reshape(-1)
+        if rotation.shape != (3, 3) or origin.shape != (3,):
+            raise ValueError(
+                "camera visibility rotation must be 3x3 and origin must be a 3-vector"
+            )
+        if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(origin)):
+            raise ValueError("camera visibility geometry must be finite")
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1.0e-5):
+            raise ValueError("rotation_visibility_from_body must be orthonormal")
+        if not np.isclose(np.linalg.det(rotation), 1.0, atol=1.0e-5):
+            raise ValueError("rotation_visibility_from_body must be a proper rotation")
+        self.rotation_visibility_from_body = rotation
+        self.camera_origin_in_body = origin
         return self
 
     @staticmethod
@@ -184,6 +232,11 @@ class MPCConfig:
 class MPCResult:
     force: Array
     force_sequence: Array
+    delta_force_sequence: Array
+    # Retained for trace/API compatibility.  The absolute-force cost has no
+    # equilibrium-centering reference, so this is always the zero vector.
+    force_reference: Array
+    model1_base_force: Array
     predicted_states: Array
     slacks: Array
     status: str
@@ -192,6 +245,8 @@ class MPCResult:
     used_fallback: bool
     model1_weight: Array
     model2_weight: Array
+    predicted_delta_yaw_rad: Array
+    predicted_actuator_force_sequence: Array | None = None
 
 
 class RelativeMPCController:
@@ -210,51 +265,149 @@ class RelativeMPCController:
         self._warm_start = None
         self._last_feasible_force = None
         self._prediction_weight = None
-        self._build_prediction_matrices(np.ones(3))
+        self._prediction_yaw_rate = None
+        self._actuator_delay_steps = 0
+        self._actuator_alpha = 1.0
+        # The command queue represents commands that have already been sent
+        # to the lower controller but whose force has not reached the vehicle
+        # yet.  It must survive successive MPC solves; rebuilding it from the
+        # latest achieved force would erase the very delay we are modelling.
+        self._actuator_command_queue: list[Array] | None = None
+        if self.config.actuator_model_enabled:
+            self._actuator_delay_steps = int(
+                np.ceil(
+                    self.config.actuator_pure_delay_s / self.model.dt
+                    - 1.0e-12
+                )
+            )
+            self._actuator_alpha = float(
+                np.exp(-self.model.dt / self.config.actuator_time_constant_s)
+            )
+            self._augmented_state_size = 12 + 3 * self._actuator_delay_steps
+        else:
+            self._augmented_state_size = 9
+        self._build_prediction_matrices(np.ones(3), 0.0)
 
     def reset(self) -> None:
         """Clear optimizer history when mode or tracked target changes."""
         self._warm_start = None
         self._last_feasible_force = None
+        self._actuator_command_queue = None
 
     def safe_force(self, tau_previous, target_force=None) -> Array:
-        """Rate-limit a safe return toward target_force (baseline by default)."""
+        """Rate-limit a safe return toward fixed Fossen balance force."""
         previous = vector3(tau_previous, "tau_previous")
         target = (
-            self.model.tau_base
+            self.model.restoring_force
             if target_force is None
             else vector3(target_force, "target_force")
         )
         return self._safe_fallback(previous, target)
 
-    def _build_prediction_matrices(self, model1_weight) -> None:
-        """Build predictions for the two-model, rolling-force formulation.
+    def _build_prediction_matrices(
+        self,
+        model1_weight,
+        yaw_rate_rad_s: float = 0.0,
+    ) -> None:
+        """Build predictions for the two-model, fixed-per-solve-base formulation.
 
-        The augmented state is z=[x, tau_previous].  With W containing the
-        per-axis model-1 weights, and tau_base treated as a model-1-only
-        baseline input, the fused physical-state equation is
+        Without the optional actuator model the augmented state is
+        ``z=[x, tau_previous]``. When enabled it additionally contains the
+        achieved actuator force, a quantized command-delay queue, and the
+        preceding command. The tracker supplies the separately slew-limited
+        only for rate costs/constraints. The tracker supplies the separately
+        slew-limited model-1 operating force ``tau_base,k``, which is held
+        fixed over the complete horizon. With W containing model-1 weights,
+        the fused physical-state equation is
 
-            x+ = A_d x + B_d tau - W B_d tau_base.
+            x+ = R_yaw (A_d x + B_d tau)
+                 - W R_yaw B_d tau_base,k
+                 - (I-W) R_yaw B_d tau_h.
 
-        a1=1 is the baseline-relative model and a1=0 is the absolute-force
-        model. tau_previous remains in z only for force-rate constraints.
+        a1=1 is the fixed matched-speed model; a1=0 is the target-stationary
+        Fossen model with fixed restoring/environment balance force ``tau_h``.
         """
         weight = np.clip(vector3(model1_weight, "model1_weight"), 0.0, 1.0)
-        if self._prediction_weight is not None and np.allclose(
-            weight, self._prediction_weight, atol=1e-12, rtol=0.0
+        yaw_rate = float(yaw_rate_rad_s)
+        if not np.isfinite(yaw_rate):
+            raise ValueError("yaw_rate_rad_s must be finite")
+        if (
+            self._prediction_weight is not None
+            and np.allclose(
+                weight, self._prediction_weight, atol=1e-12, rtol=0.0
+            )
+            and self._prediction_yaw_rate is not None
+            and np.isclose(
+                yaw_rate,
+                self._prediction_yaw_rate,
+                atol=1.0e-12,
+                rtol=0.0,
+            )
         ):
             return
-        physical_A = self.model.A_d
-        physical_B = self.model.B_d
+        # Constant-yaw-rate is the only future attitude assumption available
+        # from current telemetry. Every model step rotates the preceding body
+        # coordinates into the newly predicted body frame.
+        rotation6 = rotation_state_body_from_previous(yaw_rate * self.model.dt)
+        physical_A = rotation6 @ self.model.A_d
+        physical_B = rotation6 @ self.model.B_d
         W = np.diag(np.concatenate((weight, weight)))
-        A = np.zeros((9, 9))
-        B = np.zeros((9, 3))
-        A[:6, :6] = physical_A
-        B[:6] = physical_B
-        B[6:] = np.eye(3)
-        baseline_transition = np.zeros((9, 3))
+        if not self.config.actuator_model_enabled:
+            A = np.zeros((9, 9))
+            B = np.zeros((9, 3))
+            A[:6, :6] = physical_A
+            B[:6] = physical_B
+            B[6:] = np.eye(3)
+        else:
+            delay_steps = self._actuator_delay_steps
+            alpha = self._actuator_alpha
+            actuator_start = 6
+            queue_start = actuator_start + 3
+            previous_command_start = queue_start + 3 * delay_steps
+            A = np.zeros(
+                (self._augmented_state_size, self._augmented_state_size)
+            )
+            B = np.zeros((self._augmented_state_size, 3))
+            A[:6, :6] = physical_A
+            A[
+                actuator_start : actuator_start + 3,
+                actuator_start : actuator_start + 3,
+            ] = alpha * np.eye(3)
+            if delay_steps:
+                delayed_gain = (1.0 - alpha) * np.eye(3)
+                A[
+                    actuator_start : actuator_start + 3,
+                    queue_start : queue_start + 3,
+                ] = delayed_gain
+                for queue_index in range(delay_steps - 1):
+                    A[
+                        queue_start + 3 * queue_index : queue_start + 3 * (queue_index + 1),
+                        queue_start + 3 * (queue_index + 1) : queue_start + 3 * (queue_index + 2),
+                    ] = np.eye(3)
+                B[
+                    queue_start + 3 * (delay_steps - 1) : queue_start + 3 * delay_steps
+                ] = np.eye(3)
+                A[:6, actuator_start : actuator_start + 3] += (
+                    physical_B @ (alpha * np.eye(3))
+                )
+                A[:6, queue_start : queue_start + 3] += (
+                    physical_B @ delayed_gain
+                )
+            else:
+                current_gain = (1.0 - alpha) * np.eye(3)
+                B[actuator_start : actuator_start + 3] = current_gain
+                A[:6, actuator_start : actuator_start + 3] += (
+                    physical_B @ (alpha * np.eye(3))
+                )
+                B[:6] += physical_B @ current_gain
+            B[previous_command_start : previous_command_start + 3] = np.eye(3)
+        baseline_transition = np.zeros((A.shape[0], 3))
         baseline_transition[:6] = -W @ physical_B
-        output = np.hstack((np.eye(6), np.zeros((6, 3))))
+        restoring_transition = np.zeros((A.shape[0], 3))
+        restoring_transition[:6] = (
+            -(np.eye(6) - W) @ physical_B
+        )
+        output = np.hstack((np.eye(6), np.zeros((6, A.shape[0] - 6))))
         N = self.config.horizon
         nz, nu = A.shape[0], B.shape[1]
         nx = 6
@@ -276,19 +429,25 @@ class RelativeMPCController:
         # baseline is supplied at solve time, so this remains affine and the
         # QP stays linear.
         self.baseline_effect_matrix = np.zeros((N * nx, 3))
+        self.restoring_effect_matrix = np.zeros((N * nx, 3))
         for i in range(N):
-            accumulated = np.zeros((6, 3))
+            accumulated_baseline = np.zeros((6, 3))
+            accumulated_restoring = np.zeros((6, 3))
             for j in range(i + 1):
-                accumulated += output @ powers[j] @ baseline_transition
+                accumulated_baseline += (
+                    output @ powers[j] @ baseline_transition
+                )
+                accumulated_restoring += (
+                    output @ powers[j] @ restoring_transition
+                )
             self.baseline_effect_matrix[
                 i * nx : (i + 1) * nx
-            ] = accumulated
+            ] = accumulated_baseline
+            self.restoring_effect_matrix[
+                i * nx : (i + 1) * nx
+            ] = accumulated_restoring
 
         self.rate_matrix = np.zeros((N * nu, N * nu))
-        self.effective_force_matrix = np.zeros((N * nu, N * nu))
-        # The effective model-1/model-2 input is tau - W*tau_base. The
-        # previous force is only used by the separate rate penalty.
-        self.effective_force_matrix = np.eye(N * nu)
         for i in range(N):
             self.rate_matrix[i * nu : (i + 1) * nu, i * nu : (i + 1) * nu] = np.eye(nu)
             if i > 0:
@@ -297,6 +456,7 @@ class RelativeMPCController:
                     (i - 1) * nu : i * nu,
                 ] = -np.eye(nu)
         self._prediction_weight = weight.copy()
+        self._prediction_yaw_rate = yaw_rate
 
     def _reference_stack(self, reference_position: Array) -> Array:
         state_reference = np.concatenate((reference_position, np.zeros(3)))
@@ -307,8 +467,11 @@ class RelativeMPCController:
         free_prediction: Array,
         reference_position: Array,
         tau_previous: Array,
-        tau_base: Array,
+        force_reference: Array | None = None,
     ) -> tuple[Array, Array]:
+        # ``force_reference`` is retained for callers from the previous
+        # equilibrium-centered formulation; absolute-force cost intentionally
+        # ignores it.
         cfg = self.config
         N = cfg.horizon
         Q_stage = np.diag(np.concatenate((cfg.position_weights, cfg.velocity_weights)))
@@ -323,19 +486,14 @@ class RelativeMPCController:
         error_free = free_prediction - reference
         rate_reference = np.zeros(3 * N)
         rate_reference[:3] = tau_previous
-        input_weight = np.diag(self._prediction_weight)
-        effective_force_reference = np.tile(input_weight @ tau_base, N)
 
         P_force = 2.0 * (
             self.Su.T @ Q_bar @ self.Su
-            + self.effective_force_matrix.T @ R_bar @ self.effective_force_matrix
+            + R_bar
             + self.rate_matrix.T @ S_bar @ self.rate_matrix
         )
         q_force = 2.0 * (
             self.Su.T @ Q_bar @ error_free
-            - self.effective_force_matrix.T
-            @ R_bar
-            @ effective_force_reference
             - self.rate_matrix.T @ S_bar @ rate_reference
         )
 
@@ -418,15 +576,25 @@ class RelativeMPCController:
             np.deg2rad(cfg.vertical_half_fov_deg - cfg.fov_margin_deg)
         )
 
-        # FOV and forward-distance constraints on each predicted position.
+        # FOV and forward-distance constraints on each predicted target ray in
+        # the physical camera frame, not on body-origin coordinates.
+        visibility_rotation = cfg.rotation_visibility_from_body
+        camera_origin = cfg.camera_origin_in_body
         for step in range(N):
             state_offset = 6 * step
-            force_forward = self.Su[state_offset + cfg.forward_axis]
-            force_horizontal = self.Su[state_offset + cfg.horizontal_axis]
-            force_vertical = self.Su[state_offset + cfg.vertical_axis]
-            free_forward = free_prediction[state_offset + cfg.forward_axis]
-            free_horizontal = free_prediction[state_offset + cfg.horizontal_axis]
-            free_vertical = free_prediction[state_offset + cfg.vertical_axis]
+            position_force_gain = visibility_rotation @ self.Su[
+                state_offset : state_offset + 3
+            ]
+            position_free = visibility_rotation @ (
+                free_prediction[state_offset : state_offset + 3]
+                - camera_origin
+            )
+            force_forward = position_force_gain[cfg.forward_axis]
+            force_horizontal = position_force_gain[cfg.horizontal_axis]
+            force_vertical = position_force_gain[cfg.vertical_axis]
+            free_forward = position_free[cfg.forward_axis]
+            free_horizontal = position_free[cfg.horizontal_axis]
+            free_vertical = position_free[cfg.vertical_axis]
 
             slack_start = n_force + self.SLACKS_PER_STEP * step
 
@@ -486,12 +654,76 @@ class RelativeMPCController:
         slack_shifted = np.vstack((slack[1:], slack[-1:]))
         return np.concatenate((force_shifted.ravel(), slack_shifted.ravel()))
 
-    def _safe_fallback(self, tau_previous: Array, tau_base: Array) -> Array:
+    def _predict_actuator_force_sequence(
+        self,
+        tau_previous: Array,
+        force_sequence: Array,
+        initial_queue: list[Array] | None = None,
+    ) -> Array:
+        """Replay the configured actuator state for diagnostics."""
+        commands = np.asarray(force_sequence, dtype=float).reshape(-1, 3)
+        if not self.config.actuator_model_enabled:
+            return commands.copy()
+        actuator = vector3(tau_previous, "tau_previous").copy()
+        if initial_queue is None:
+            queue = [actuator.copy() for _ in range(self._actuator_delay_steps)]
+        else:
+            if len(initial_queue) != self._actuator_delay_steps:
+                raise ValueError("initial_queue has the wrong actuator delay length")
+            queue = [vector3(item, "initial_queue_item").copy() for item in initial_queue]
+        predicted: list[Array] = []
+        for command in commands:
+            if queue:
+                applied = queue.pop(0)
+                queue.append(command.copy())
+            else:
+                applied = command
+            actuator = (
+                self._actuator_alpha * actuator
+                + (1.0 - self._actuator_alpha) * applied
+            )
+            predicted.append(actuator.copy())
+        return np.asarray(predicted)
+
+    def _actuator_queue_for_solve(self, tau_previous: Array) -> list[Array]:
+        """Return the queued commands, initializing from measured force once.
+
+        The measured achieved force is used to re-anchor the current actuator
+        state at every visual update.  The command queue, however, is retained
+        across updates so a command sent during the previous interval remains
+        in the prediction until its configured delay has elapsed.
+        """
+
+        if not self.config.actuator_model_enabled:
+            return []
+        previous = vector3(tau_previous, "tau_previous")
+        if self._actuator_command_queue is None:
+            self._actuator_command_queue = [
+                previous.copy() for _ in range(self._actuator_delay_steps)
+            ]
+        if len(self._actuator_command_queue) != self._actuator_delay_steps:
+            raise RuntimeError("actuator command queue length changed at runtime")
+        return [item.copy() for item in self._actuator_command_queue]
+
+    def _advance_actuator_queue(self, command: Array) -> None:
+        """Latch the command actually sent for the next MPC solve."""
+
+        if not self.config.actuator_model_enabled:
+            return
+        if self._actuator_delay_steps == 0:
+            self._actuator_command_queue = []
+            return
+        if self._actuator_command_queue is None:
+            raise RuntimeError("actuator queue was not initialized before advance")
+        self._actuator_command_queue.pop(0)
+        self._actuator_command_queue.append(vector3(command, "command").copy())
+
+    def _safe_fallback(self, tau_previous: Array, target_force: Array) -> Array:
         cfg = self.config
         previous = np.clip(tau_previous, cfg.force_min, cfg.force_max)
         low = np.maximum(cfg.force_min, previous + cfg.delta_force_min)
         high = np.minimum(cfg.force_max, previous + cfg.delta_force_max)
-        force = np.minimum(np.maximum(tau_base, low), high)
+        force = np.minimum(np.maximum(target_force, low), high)
         if cfg.thruster_command_matrix is None:
             return force
 
@@ -534,39 +766,62 @@ class RelativeMPCController:
         tau_base=None,
         reference_position=None,
         model1_weight=None,
+        yaw_rate_rad_s: float = 0.0,
     ) -> MPCResult:
         state = np.asarray(state, dtype=float).reshape(-1)
         if state.shape != (6,) or not np.all(np.isfinite(state)):
             raise ValueError("state must be [p_rel(3), v_rel(3)]")
         tau_previous = vector3(tau_previous, "tau_previous")
-        # tau_base is a model-1-only baseline and is also the safe fallback
-        # target. It is multiplied by the model-1 weight; model 2 sees zero
-        # baseline contribution.
-        fallback_baseline = (
-            self.model.tau_base
+        # The actual preceding achieved force remains the first force-rate
+        # reference.  Model 1 may use a separately slew-limited operating
+        # force, which is still fixed over this complete solve horizon.
+        baseline = (
+            tau_previous.copy()
             if tau_base is None
             else vector3(tau_base, "tau_base")
         )
-        baseline = fallback_baseline.copy()
+        restoring = self.model.restoring_force.copy()
         weight1 = (
             np.ones(3)
             if model1_weight is None
             else np.clip(vector3(model1_weight, "model1_weight"), 0.0, 1.0)
         )
-        self._build_prediction_matrices(weight1)
+        # Penalize absolute total propulsion effort.  The model-specific
+        # operating forces remain in the state prediction only; they must not
+        # create a linear incentive to maintain a large baseline force.
+        force_reference = np.zeros(3)
+        self._build_prediction_matrices(weight1, yaw_rate_rad_s)
         reference = (
             self.config.reference_position
             if reference_position is None
             else vector3(reference_position, "reference_position")
         )
 
-        augmented_state = np.concatenate((state, tau_previous))
+        actuator_queue = self._actuator_queue_for_solve(tau_previous)
+        if self.config.actuator_model_enabled:
+            augmented_state = np.zeros(self._augmented_state_size)
+            augmented_state[:6] = state
+            augmented_state[6:9] = tau_previous
+            queue_start = 9
+            for index, queued_command in enumerate(actuator_queue):
+                augmented_state[
+                    queue_start + 3 * index : queue_start + 3 * (index + 1)
+                ] = queued_command
+            augmented_state[queue_start + 3 * self._actuator_delay_steps :] = (
+                tau_previous
+            )
+        else:
+            augmented_state = np.concatenate((state, tau_previous))
         free_prediction = (
             self.Sx @ augmented_state
             + self.baseline_effect_matrix @ baseline
+            + self.restoring_effect_matrix @ restoring
         )
         P, q = self._cost(
-            free_prediction, reference, tau_previous, baseline
+            free_prediction,
+            reference,
+            tau_previous,
+            force_reference,
         )
         constraint_matrix, lower, upper = self._constraints(
             free_prediction, tau_previous
@@ -610,8 +865,8 @@ class RelativeMPCController:
             status = solution.status
         else:
             if self._last_feasible_force is None:
-                fallback_target = fallback_baseline
-                fallback_source = "baseline"
+                fallback_target = restoring
+                fallback_source = "restoring_force"
             else:
                 fallback_target = self._last_feasible_force
                 fallback_source = "last_feasible"
@@ -625,11 +880,29 @@ class RelativeMPCController:
         predicted = (
             self.Sx @ augmented_state
             + self.baseline_effect_matrix @ baseline
+            + self.restoring_effect_matrix @ restoring
             + self.Su @ force_sequence.ravel()
         ).reshape(N, 6)
+        rate_reference = np.zeros(3 * N)
+        rate_reference[:3] = tau_previous
+        delta_force_sequence = (
+            self.rate_matrix @ force_sequence.ravel() - rate_reference
+        ).reshape(N, 3)
+        predicted_actuator_force_sequence = self._predict_actuator_force_sequence(
+            tau_previous,
+            force_sequence,
+            initial_queue=actuator_queue,
+        )
+        # The first command may have been projected into the joint thruster
+        # envelope after the QP solve.  Retain that command in the delay queue,
+        # because it is the value that will actually be sent to the vehicle.
+        self._advance_actuator_queue(force)
         return MPCResult(
             force=force,
             force_sequence=force_sequence,
+            delta_force_sequence=delta_force_sequence,
+            force_reference=force_reference.copy(),
+            model1_base_force=baseline.copy(),
             predicted_states=predicted,
             slacks=slacks,
             status=status,
@@ -638,4 +911,9 @@ class RelativeMPCController:
             used_fallback=used_fallback,
             model1_weight=weight1.copy(),
             model2_weight=1.0 - weight1,
+            predicted_delta_yaw_rad=np.full(
+                N,
+                float(yaw_rate_rad_s) * self.model.dt,
+            ),
+            predicted_actuator_force_sequence=predicted_actuator_force_sequence,
         )

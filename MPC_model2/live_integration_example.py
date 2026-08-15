@@ -34,27 +34,34 @@ def to_finesub_command(output, *, armed: bool, adapter=None):
 
 def build_tracker() -> MPCTracker:
     model = FixedLinearDampingRelativeModel(
-        # TODO: replace placeholders with pool-identification results.
-        M_t=np.diag([20.0, 25.0, 30.0]),
-        D_L=np.diag([8.0, 10.0, 12.0]),
+        # Identified from UnderwaterVision direct-force step responses.
+        # Axis order is body forward/right/down = Unity X/Z/-Y.
+        M_t=np.diag([26.07276, 26.79684, 26.07276]),
+        D_L=np.diag([93.88006, 143.69195, 280.86849]),
         dt=0.05,
-        # Used only as the safe target when tracking stops or the QP fails.
-        tau_base=np.zeros(3),
+        # The shared model type carries a compatibility tau_base field, but
+        # model 2 never reads it in prediction, estimation, or normal control.
     )
     config = MPCConfig(
         horizon=10,
-        reference_position=(0.60, 0.0, 0.0),
-        position_weights=(50.0, 100.0, 100.0),
-        velocity_weights=(8.0, 12.0, 12.0),
-        force_weights=(0.04, 0.06, 0.06),
-        delta_force_weights=(0.8, 1.0, 1.0),
-        force_min=(-20.0, -15.0, -15.0),
-        force_max=(20.0, 15.0, 15.0),
-        delta_force_min=(-3.0, -2.0, -2.0),
-        delta_force_max=(3.0, 2.0, 2.0),
+        reference_position=(0.80, 0.0, 0.0),
+        # Selected after Unity straight-ping-pong tuning.  These values are
+        # intentionally aggressive because pure model 2 has no tau_base.
+        position_weights=(60000.0, 10000.0, 120000.0),
+        velocity_weights=(0.2, 0.5, 0.5),
+        terminal_position_weight_scale=4.0,
+        terminal_velocity_weight_scale=4.0,
+        force_weights=(0.0005, 0.0015, 0.003),
+        delta_force_weights=(0.02, 0.06, 0.12),
+        force_min=(-19.799, -19.799, -28.0),
+        force_max=(19.799, 19.799, 28.0),
+        delta_force_min=(-4.0, -4.0, -5.6),
+        delta_force_max=(4.0, 4.0, 5.6),
         horizontal_half_fov_deg=42.0,
         vertical_half_fov_deg=30.0,
         fov_margin_deg=5.0,
+        slack_quadratic_weight=5.0e4,
+        slack_linear_weight=100.0,
     )
     estimator = RelativePositionKalmanFilter(
         model,
@@ -62,12 +69,12 @@ def build_tracker() -> MPCTracker:
     )
     controller = RelativeMPCController(model, config)
     adapter = ForceCommandAdapter(
-        positive_force_at_limit=(20.0, 15.0, 15.0),
+        positive_force_at_limit=(19.799, 19.799, 28.0),
         signs=(1.0, 1.0, 1.0),
         command_limits=(99.0, 99.0, 45.0),
     )
     allocator = FineSUBThrusterAllocator(
-        positive_force_at_limit=(20.0, 15.0, 15.0),
+        positive_force_at_limit=(19.799, 19.799, 28.0),
         enable_depth=True,
     )
     return MPCTracker(

@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import numpy as np
 
 try:
+    from .camera_transform import rotation_state_body_from_previous
     from .fossen_fixed_dl_model import FixedLinearDampingRelativeModel, vector3
 except ImportError:
+    from camera_transform import rotation_state_body_from_previous
     from fossen_fixed_dl_model import FixedLinearDampingRelativeModel, vector3
 
 
@@ -58,25 +60,45 @@ class RelativePositionKalmanFilter:
         self.initialized = True
         return self.x.copy()
 
-    def predict(self, tau_achieved, tau_base=None) -> np.ndarray:
+    def predict(self, tau_achieved, yaw_delta_rad: float = 0.0) -> np.ndarray:
+        """Predict the target-stationary Fossen branch.
+
+        The dual tracker supplies its fused mean through ``predict_mean``;
+        this public helper deliberately uses the unambiguous model-2 input
+        ``tau-tau_h``.
+        """
         if not self.initialized:
             raise RuntimeError("filter must be initialized before predict")
-        base = self.model.tau_base if tau_base is None else vector3(tau_base, "tau_base")
-        delta_tau = vector3(tau_achieved, "tau_achieved") - base
-        self.x = self.model.A_d @ self.x + self.model.B_d @ delta_tau
-        self.P = self.model.A_d @ self.P @ self.model.A_d.T + self.Q
+        effective_force = (
+            vector3(tau_achieved, "tau_achieved")
+            - self.model.restoring_force
+        )
+        rotation = rotation_state_body_from_previous(yaw_delta_rad)
+        transition = rotation @ self.model.A_d
+        self.x = rotation @ (
+            self.model.A_d @ self.x + self.model.B_d @ effective_force
+        )
+        process_covariance = rotation @ self.Q @ rotation.T
+        self.P = transition @ self.P @ transition.T + process_covariance
         self.P = 0.5 * (self.P + self.P.T)
         return self.x.copy()
 
-    def predict_mean(self, predicted_state) -> np.ndarray:
-        """Advance covariance with A_d while supplying a fused predicted mean."""
+    def predict_mean(
+        self,
+        predicted_state,
+        yaw_delta_rad: float = 0.0,
+    ) -> np.ndarray:
+        """Advance covariance in the new body frame for a fused mean."""
         if not self.initialized:
             raise RuntimeError("filter must be initialized before predict")
         mean = np.asarray(predicted_state, dtype=float).reshape(-1)
         if mean.shape != (6,) or not np.all(np.isfinite(mean)):
             raise ValueError("predicted_state must be finite with shape (6,)")
         self.x = mean.copy()
-        self.P = self.model.A_d @ self.P @ self.model.A_d.T + self.Q
+        rotation = rotation_state_body_from_previous(yaw_delta_rad)
+        transition = rotation @ self.model.A_d
+        process_covariance = rotation @ self.Q @ rotation.T
+        self.P = transition @ self.P @ transition.T + process_covariance
         self.P = 0.5 * (self.P + self.P.T)
         return self.x.copy()
 
@@ -97,8 +119,13 @@ class RelativePositionKalmanFilter:
         self.P = 0.5 * (self.P + self.P.T)
         return self.x.copy()
 
-    def step(self, position_measurement, tau_achieved, tau_base=None) -> np.ndarray:
+    def step(
+        self,
+        position_measurement,
+        tau_achieved,
+        yaw_delta_rad: float = 0.0,
+    ) -> np.ndarray:
         if not self.initialized:
             return self.initialize(position_measurement)
-        self.predict(tau_achieved, tau_base)
+        self.predict(tau_achieved, yaw_delta_rad=yaw_delta_rad)
         return self.update(position_measurement)

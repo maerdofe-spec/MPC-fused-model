@@ -5,12 +5,20 @@ Coordinate convention used by the MPC package:
     p_rel = p_target - p_vehicle
     v_rel = v_target - v_vehicle
 
-The reduced model is
+The zero-speed reduced vehicle model is
 
-    M_t v_rel_dot + D_L v_rel = -(tau - tau_base)
-    p_rel_dot = v_rel
+    M_t u_dot + D_L u + tau_h = tau
 
-where M_t includes translational added mass and D_L is held fixed.
+where ``tau_h=h(0)`` is the fixed restoring/environment balance force.  The
+relative-motion candidates from the design PDF are
+
+    model 1: v_rel+ = F v_rel + G (tau - tau_base,k)
+    model 2: v_rel+ = F v_rel + G (tau - tau_h)
+
+The translation tracker updates ``tau_base,k`` with a per-axis gated EMA of
+the achieved force, then holds it fixed over that solve's complete horizon.
+Consecutive planned forces and the first actual force change remain separate
+force-rate cost/constraint quantities. ``tau_h`` is never learned by that EMA.
 """
 
 from __future__ import annotations
@@ -117,17 +125,23 @@ def zero_order_hold(A, B, dt: float) -> tuple[Array, Array]:
 
 @dataclass
 class FixedLinearDampingRelativeModel:
-    """Fixed-D_L three-axis model and its exact discrete state matrices."""
+    """Fixed-D_L model with a separate, immutable Fossen balance force."""
 
     M_t: object
     D_L: object
     dt: float
-    tau_base: object = (0.0, 0.0, 0.0)
+    restoring_force: object = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:
         self.M_t = matrix3(self.M_t, "M_t")
         self.D_L = matrix3(self.D_L, "D_L")
-        self.tau_base = vector3(self.tau_base, "tau_base")
+        self.restoring_force = vector3(
+            self.restoring_force, "restoring_force"
+        )
+        self.restoring_force.setflags(write=False)
+        # Compatibility storage for the inactive legacy yaw/model-2 packages.
+        # The maintained dual tracker/controller never reads this value.
+        self._legacy_tau_base = np.zeros(3)
         if not np.isfinite(self.dt) or self.dt <= 0.0:
             raise ValueError("dt must be positive")
         if not np.allclose(self.M_t, self.M_t.T, atol=1e-10):
@@ -149,12 +163,40 @@ class FixedLinearDampingRelativeModel:
             [[np.zeros((3, 3)), I3], [np.zeros((3, 3)), self.A_v]]
         )
         self.B_c = np.vstack((np.zeros((3, 3)), self.B_v))
-        self.A_d, self.B_d = zero_order_hold(self.A_c, self.B_c, self.dt)
+
+        # Match the supplied PDF exactly: velocity is propagated by exact ZOH
+        # and position then uses the end-of-step relative velocity.
+        #
+        #   v+ = F v + G f_eff
+        #   p+ = p + dt v+
+        self.A_d = np.block(
+            [[I3, self.dt * self.F], [np.zeros((3, 3)), self.F]]
+        )
+        self.B_d = np.vstack((self.dt * self.G, self.G))
         if np.max(np.abs(np.linalg.eigvals(self.F))) > 1.0 + 1e-9:
             raise ValueError("M_t and D_L produce an unstable velocity model")
 
+    @property
+    def tau_h(self) -> Array:
+        """Fixed ``h(0)`` force in body FRD coordinates."""
+        return self.restoring_force.copy()
+
+    @property
+    def tau_base(self) -> Array:
+        """Legacy-only storage; maintained dual code must not use this."""
+        return self._legacy_tau_base.copy()
+
+    @tau_base.setter
+    def tau_base(self, value) -> None:
+        self._legacy_tau_base = vector3(value, "legacy_tau_base")
+
     def set_tau_base(self, tau_achieved) -> None:
-        self.tau_base = vector3(tau_achieved, "tau_achieved")
+        """Legacy compatibility for inactive packages.
+
+        The active dual model uses the caller-supplied preceding force and
+        never consults this value.
+        """
+        self.tau_base = tau_achieved
 
     def predict_delta(self, p_rel, v_rel, delta_tau) -> tuple[Array, Array]:
         state = np.concatenate(
@@ -163,21 +205,40 @@ class FixedLinearDampingRelativeModel:
         state_next = self.A_d @ state + self.B_d @ vector3(delta_tau, "delta_tau")
         return state_next[:3], state_next[3:]
 
-    def predict(self, p_rel, v_rel, tau, tau_base=None) -> tuple[Array, Array]:
-        base = self.tau_base if tau_base is None else vector3(tau_base, "tau_base")
-        return self.predict_delta(p_rel, v_rel, vector3(tau, "tau") - base)
+    def predict_stationary(self, p_rel, v_rel, tau) -> tuple[Array, Array]:
+        """Predict model 2 using total force minus fixed ``h(0)``."""
+        effective = vector3(tau, "tau") - self.restoring_force
+        return self.predict_delta(p_rel, v_rel, effective)
 
-    def rollout(self, p_rel, v_rel, tau_sequence: Iterable, tau_base=None) -> Array:
+    def predict_matched(
+        self,
+        p_rel,
+        v_rel,
+        tau,
+        tau_base,
+    ) -> tuple[Array, Array]:
+        """Predict model 1 about one solve's fixed matched-force point."""
+        delta = vector3(tau, "tau") - vector3(tau_base, "tau_base")
+        return self.predict_delta(p_rel, v_rel, delta)
+
+    def predict(self, p_rel, v_rel, tau) -> tuple[Array, Array]:
+        """Predict the target-stationary branch from total physical force."""
+        return self.predict_stationary(p_rel, v_rel, tau)
+
+    def rollout(self, p_rel, v_rel, tau_sequence: Iterable) -> Array:
+        """Roll out the target-stationary branch."""
         p = vector3(p_rel, "p_rel")
         v = vector3(v_rel, "v_rel")
-        base = self.tau_base if tau_base is None else vector3(tau_base, "tau_base")
         states = [np.concatenate((p, v))]
         for tau in tau_sequence:
-            p, v = self.predict(p, v, tau, base)
+            p, v = self.predict_stationary(p, v, tau)
             states.append(np.concatenate((p, v)))
         return np.asarray(states)
 
     def absolute_force_affine_model(self) -> tuple[Array, Array, Array]:
         """Return x_next=A_d*x+B_d*tau+c for absolute-force optimizers."""
-        return self.A_d.copy(), self.B_d.copy(), -self.B_d @ self.tau_base
-
+        return (
+            self.A_d.copy(),
+            self.B_d.copy(),
+            -self.B_d @ self.restoring_force,
+        )

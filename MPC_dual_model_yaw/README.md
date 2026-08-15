@@ -14,7 +14,7 @@
         -> yaw 角度外环 + 角速度内环，得到 N
         -> 冻结未来 psi/omega/N 轨迹
         -> 联合 QP 优化 Delta tau 和每步八台推进器力
-        -> 六轴等式同时满足平移、零 roll/pitch 力矩和冻结 yaw 力矩
+        -> 实机 M1..M8 四轴等式同时满足平移和冻结 yaw 力矩
 ```
 
 `N` 不再是 QP 的第 4 个决策量，但它以冻结参数进入每个预测步的推进器等式。一次 QP 求解期间，yaw 目标及预测旋转矩阵固定；到下一实际控制周期，控制器根据新相机和 IMU 测量重新生成。
@@ -79,12 +79,15 @@ MPC 的水平、垂直视场约束也作用于同一个 `p_vis`，平移动力�
 ## 4. 平移双模型和 QP
 
 设模型一权重为逐轴对角矩阵 `A1`，决策变量为
-`u[j]=Delta tau[j]`。模型一只使用基线相对力，模型二使用绝对力：
+`u[j]=Delta tau[j]`。`tau_base,k` 在每次求解开始时直接取上一拍实际达到的力，
+并在该次完整 horizon 内保持不变；它不是 EMA 参数。`tau_h=h(0)` 是固定写入
+Fossen 方程的恢复/平衡力：
 
 ```text
 model1: f_eff[j] = tau[j] - tau_base
-model2: f_eff[j] = tau[j]
-v[j+1] = R[j]Fv[j] + R[j]Gtau[j] - A1 R[j]Gtau_base
+model2: f_eff[j] = tau[j] - tau_h
+v[j+1] = R[j]Fv[j] + R[j]Gtau[j]
+         - A1 R[j]Gtau_base - (I-A1) R[j]Gtau_h
 ```
 
 令 `e=p-p_d`，增广状态为：
@@ -102,37 +105,35 @@ e[j+1] = R[j]e[j] + Ts v[j+1] + (R[j]-I)p_d
 
 这形成仿射线性时变模型 `x[j+1]=A[j]x[j]+B[j]u[j]+d[j]`，因此在冻结 yaw 轨迹后仍是凸 QP。
 
-代价包括多步位置误差、速度、控制作用和力增量。默认
-`force_cost_mode="effective"`，惩罚与平移版相同的融合有效输入：
+代价包括多步位置误差、速度、绝对总力和相邻力增量：
 
 ```text
-g[j] = tau[j] - A1 tau_base
+J_force = sum tau[j]' R_tau tau[j]
+J_delta = sum (tau[j]-tau[j-1])' S_tau (tau[j]-tau[j-1])
 ```
 
-`tau_previous` 只保留在增广状态中用于力增量和绝对力递推，不再作为模型一基线。
-动力学使用精确融合项 `-A1 R G tau_base`；当 yaw 非零且三轴权重不同时，
-`R G A1` 与 `A1 R G` 不一定相等，因此力域的 `g[j]` 仍是代价代理，不是动力学项的
-严格因式分解。
-若只为逐字复现 PDF 中的 `tau' R tau`，可设置
-`force_cost_mode="absolute"`。
+第一项力增量为 `tau[0]-tau_achieved[k-1]`。旧的 `effective-force` 模式及
+`force_cost_mode` 开关已经删除，避免基线力被错误当成“免费控制量”。
 
 约束包括：
 
 - 三轴绝对力限制；
 - 三轴力增量限制；
-- V4 Pro1 八台推进器逐台、正反向非对称的六轴联合可达域；
+- V4 Pro1 八台推进器逐台、正反向非对称的平移+yaw 联合可达域；
 - 带松弛量的水平、垂直视场和前向距离限制。
 
 每个预测步额外包含八个推进器力变量 `u_thr`，并执行：
 
 ```text
-W_6x8 u_thr[j] = [Fx,Fright,Fdown,0_roll,0_pitch,N_yaw][j]
+W_4x8 u_thr[j] = [Fx,Fright,Fdown,N_yaw][j]
 -F_reverse[i] <= u_thr[i,j] <= F_forward[i]
 ```
 
-因此平移和 yaw 会真实占用同一组推进器余量，且保留八推进器相对六轴任务的零空间，
-不再用固定伪逆分配缩小可达域。当前 V4 Pro1 单台正向限额为 `7.3809..8.4749 N`，
-反向限额为 `5.7618..7.9750 N`。
+因此平移和 yaw 会占用同一组推进器余量，且保留八推进器相对四轴任务的零空间，
+不再用固定伪逆分配缩小可达域。矩阵顺序与固件/遥测一致，直接采用实机 M1..M8
+正油门力方向和 CAD 原点 yaw 力臂；当前实验构造器将同艇全油门逐桨曲线缩放到
+`0.20` 包络。未知 CG 和本地下位机 roll/pitch PID 用量不进入 QP，所以这仍不是完整
+六轴实测可达域。
 
 ## 5. 二维历史阶梯评价
 
@@ -164,6 +165,7 @@ uv run --project MPC_dual_model python -m MPC_dual_model_yaw.example_yaw_simulat
 from MPC_dual_model_yaw.live_integration_example import (
     build_tracker,
     one_control_update,
+    to_finesub_command,
 )
 
 tracker = build_tracker()
@@ -183,32 +185,38 @@ output = one_control_update(
 tau = output.mpc.force
 N = output.yaw_control.yaw_moment
 mode = output.yaw_control.mode
-motor = output.thruster_allocation.throttles
+motor_force_diagnostic = output.mpc.thruster_force
+command = to_finesub_command(output, armed=True)
 ```
 
 相机位置、IMU yaw 和 IMU `omega` 必须对应同一拍摄时刻。`one_control_update()`
 会同时保留两套几何量：转换到机体系的位置供平移动力学和卡尔曼滤波使用；从相机光心
 出发的 `[前、右、下]` 视线射线供 yaw 状态机和水平/垂直视场约束使用。因此非零
-`r_bc_body` 或非正装相机不会凭空产生偏航误差。只能选择“发送高层力/姿态通道”或
-“直接发送八路推进器”其中一种执行链路，不能让 Python 和 MCU 重复混控。
+`r_bc_body` 或非正装相机不会凭空产生偏航误差。实机安全入口发送高层
+`[forward,right,down,yaw]`，由 MCU 混控；`output.mpc.thruster_force` 是 QP 可达域
+对应的诊断分配，不能再作为第二套命令重复下发。
 
-调用 `target_lost()` 后，安全力和 yaw 力矩仍按各自变化率限制逐拍退回锁存基准；同时
+调用 `target_lost()` 后，平移力按变化率退回固定 `tau_h`，yaw 力矩退回其锁存基准；同时
 旧目标的卡尔曼状态、融合历史、yaw 目标/PID 和时间基准会被清空。下一帧有效视觉测量
 会以当前 IMU yaw 建立新的 `HOLD` 方向，并从该测量重新初始化目标位置和速度，避免
 完成丢失前遗留的转向目标或把多帧缺测压缩成一次 `dt` 状态更新。
 
-## 7. 当前仿真参数与边界
+## 7. 当前实机候选参数与边界
 
-- 当前 UnderwaterVision 闭环估计使用 `effective_inertia=0.8 kg*m^2`、
-  `linear_damping=0.8 N*m/(rad/s)`；yaw 触发回差为 `4.0/1.5 deg`，力矩限额
-  `+-2.0 N*m`、单周期变化 `+-0.3 N*m`。这些只适用于当前 Unity 工况，不能直接上实机。
-- 在 `0.18 m/s、R=0.10 m` 连续跑道试验中，主动 yaw 相对同约束的航向保持基线将
-  平均误差从 `0.1248 m` 降到 `0.0994 m`，P95 从 `0.1709 m` 降到 `0.1431 m`。
+- `build_tracker()` 和安全实机入口共用严格构造器，读取
+  `experimental_auto.active_mpc_parameters` 与 `active_yaw_parameters`：`dt=0.10 s`、`N=5`、实机 `M/D`、
+  `tau_h=[0,0,0.80729] N`、0.6 m 相机参考对应的机体系参考点、当前 Q/Qv/R/S、
+  卡尔曼、融合、相机外参与 `0.20` 三轴限额，不再复制仿真参数。
+- yaw 动力学读取实机候选 `effective_inertia=0.33453415 kg*m^2`、
+  `linear_damping=0.32251723 N*m/(rad/s)`；它在参数文件中仍为
+  `enabled_for_control=false`，上层双环 PID 也尚未水池闭环验证。
+- `build_hardware_adapter()` 与正式平移入口共用最终电机油门回显反算实际力；RPM 推力
+  估计只记录诊断，不会覆盖 `tau_achieved/tau_base`。
 - 仅补偿 yaw，不包含 roll/pitch 对视觉相对坐标的旋转影响。
 - 尚未实现相机延迟的 IMU 历史回放。
-- QP 已使用完整六轴几何和 V4 Pro1 正反推力限额，但死区、电池电压、推进器互扰及
-  几何/质心误差仍需实机标定。
-- 默认要求 OSQP；未安装时会在控制器构造阶段明确报错，不会在 20 Hz 循环中静默切换到较慢求解器。
+- QP 使用实机 M1..M8 的四轴平移+yaw 几何和正反推力限额；roll/pitch 余量、死区、
+  电池电压、推进器互扰及几何/质心误差仍未建模。
+- 默认要求 OSQP；未安装时会在控制器构造阶段明确报错，不会在 10 Hz 循环中静默切换到较慢求解器。
 
 完整实机参数见 `CALIBRATION_CHECKLIST.md`；与 PDF 和参考推导的逐项差异见
 `MODEL_DIFFERENCES.md`。

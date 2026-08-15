@@ -70,6 +70,56 @@ class Model2MPCTest(unittest.TestCase):
         np.testing.assert_allclose(predicted_a, expected, atol=1e-12)
         np.testing.assert_allclose(predicted_b, expected, atol=1e-12)
 
+    def test_controller_prediction_and_cost_ignore_tau_base(self):
+        model, controller = self.build()
+        state = np.array([1.0, 0.1, -0.05, 0.02, -0.01, 0.0])
+        previous = np.array([2.0, -1.0, 0.5])
+
+        model.set_tau_base((0.0, 0.0, 0.0))
+        result_zero = controller.solve(state, previous)
+        controller.reset()
+        model.set_tau_base((9.0, -7.0, 5.0))
+        result_nonzero = controller.solve(state, previous)
+
+        np.testing.assert_allclose(result_nonzero.force, result_zero.force, atol=1e-8)
+        np.testing.assert_allclose(
+            result_nonzero.predicted_states,
+            result_zero.predicted_states,
+            atol=1e-8,
+        )
+        self.assertAlmostEqual(result_nonzero.objective, result_zero.objective, places=7)
+
+    def test_terminal_position_and_velocity_weights_are_independent(self):
+        model, _ = self.build()
+        position_heavy = RelativeMPCController(
+            model,
+            MPCConfig(
+                horizon=4,
+                terminal_position_weight_scale=9.0,
+                terminal_velocity_weight_scale=1.0,
+            ),
+        )
+        velocity_heavy = RelativeMPCController(
+            model,
+            MPCConfig(
+                horizon=4,
+                terminal_position_weight_scale=1.0,
+                terminal_velocity_weight_scale=9.0,
+            ),
+        )
+        free = np.zeros(24)
+        reference = np.array([0.8, 0.0, 0.0])
+        previous = np.zeros(3)
+        P_position, _ = position_heavy._cost(free, reference, previous)
+        P_velocity, _ = velocity_heavy._cost(free, reference, previous)
+
+        self.assertFalse(np.allclose(P_position, P_velocity))
+
+    def test_legacy_terminal_scale_populates_both_terminal_weights(self):
+        config = MPCConfig(terminal_weight_scale=7.0).normalized()
+        self.assertEqual(config.terminal_position_weight_scale, 7.0)
+        self.assertEqual(config.terminal_velocity_weight_scale, 7.0)
+
     def test_public_model_and_filter_ignore_fallback_baseline(self):
         model, _ = self.build()
         model.set_tau_base((9.0, -4.0, 2.0))

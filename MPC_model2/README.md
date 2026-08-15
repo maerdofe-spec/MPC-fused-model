@@ -8,7 +8,7 @@
 x[k+1] = A_d x[k] + B_d tau[k]
 ```
 
-其中 `x=[p_rel,v_rel]`，`p_rel=p_target-p_vehicle`，`tau` 是当前绝对三轴综合力。上一拍力 `tau[k-1]` 只用于力变化量代价和变化率约束，不参与模型二状态预测。
+其中 `x=[p_rel,v_rel]`，`p_rel=p_target-p_vehicle`，`tau` 是当前绝对三轴综合力。上一拍力 `tau[k-1]` 只用于力变化量代价和变化率约束，不参与模型二状态预测。`tau_base` 也不进入模型二预测、估计或正常求解代价。
 
 本版本没有：
 
@@ -16,7 +16,9 @@ x[k+1] = A_d x[k] + B_d tau[k]
 - 在线残差窗口和双模型融合权重；
 - `model1_weight` / `model2_weight` 输入或输出。
 
-矩阵指数、QP 求解器、坐标变换和 FineSUB 分配器复用相邻的双模型目录；本目录单独封装了模型二的 Fossen 预测和卡尔曼时间更新。运行时固定模型一权重为零，不实例化 `OnlineModelFusion`，也不计算模型一候选预测。
+矩阵指数、QP 求解器、坐标变换和 FineSUB 分配器复用相邻目录；本目录单独构造模型二预测矩阵和代价，不再通过“模型一权重为零”的方式间接调用双模型预测，也不实例化 `OnlineModelFusion`。
+
+终端代价使用独立的 `terminal_position_weight_scale` 与 `terminal_velocity_weight_scale`。两者都设为 `4.0` 时与旧版统一放大四倍等价，可在 Unity 对比时分别调节。
 
 ## 坐标与输入输出
 
@@ -35,3 +37,5 @@ python -m MPC_model2.example_simulation
 ```
 
 实机接入入口见 `live_integration_example.py`。上机前必须重新标定 `M_t`、`D_L`、力与命令的比例、符号、相机外参、噪声和全部限幅。MCU 高层混控与 Python 八推进器直控只能选择一种，不能重复分配。
+
+ROS/Unity 接入时使用桥接参数 `model_backend:=model2`，并将 `params_file` 指向 `mpc_translation_model2.yaml`。默认双模型参数文件仍保持不变。

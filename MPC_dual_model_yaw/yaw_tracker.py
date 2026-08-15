@@ -15,7 +15,6 @@ from MPC_dual_model.device_adapter import (
 )
 from MPC_dual_model.fossen_fixed_dl_model import vector3
 from MPC_dual_model.model_fusion import FusionConfig, OnlineModelFusion
-from MPC_dual_model.mpc_tracker import BaselineAdaptationConfig
 
 from .yaw_kalman import RotationAwareKalmanFilter
 from .yaw_controller import YawControlResult, YawStateController
@@ -57,6 +56,7 @@ class YawMomentChannelAdapter:
     positive_yaw_moment_at_limit: float = 4.0
     channel_limit: float = 0.20
     sign: float = 1.0
+    negative_yaw_moment_at_limit: float | None = None
 
     def __post_init__(self) -> None:
         self.positive_yaw_moment_at_limit = finite_scalar(
@@ -65,8 +65,18 @@ class YawMomentChannelAdapter:
         )
         self.channel_limit = finite_scalar(self.channel_limit, "channel_limit")
         self.sign = finite_scalar(self.sign, "sign")
+        self.negative_yaw_moment_at_limit = (
+            self.positive_yaw_moment_at_limit
+            if self.negative_yaw_moment_at_limit is None
+            else finite_scalar(
+                self.negative_yaw_moment_at_limit,
+                "negative_yaw_moment_at_limit",
+            )
+        )
         if self.positive_yaw_moment_at_limit <= 0.0:
             raise ValueError("positive_yaw_moment_at_limit must be positive")
+        if self.negative_yaw_moment_at_limit <= 0.0:
+            raise ValueError("negative_yaw_moment_at_limit must be positive")
         if self.channel_limit <= 0.0:
             raise ValueError("channel_limit must be positive")
         if abs(self.sign) != 1.0:
@@ -74,10 +84,15 @@ class YawMomentChannelAdapter:
 
     def convert(self, yaw_moment: float) -> float:
         moment = finite_scalar(yaw_moment, "yaw_moment")
+        signed_moment = self.sign * moment
+        scale = (
+            self.positive_yaw_moment_at_limit
+            if signed_moment >= 0.0
+            else self.negative_yaw_moment_at_limit
+        )
         raw = (
-            self.sign
-            * moment
-            / self.positive_yaw_moment_at_limit
+            signed_moment
+            / scale
             * self.channel_limit
         )
         return float(np.clip(raw, -self.channel_limit, self.channel_limit))
@@ -132,7 +147,6 @@ class RotationAwareMPCTracker:
         yaw_adapter: YawMomentChannelAdapter,
         fusion: OnlineModelFusion | None = None,
         thruster_allocator: FineSUBThrusterAllocator | None = None,
-        baseline_adaptation: BaselineAdaptationConfig | None = None,
     ) -> None:
         if estimator.model is not model or controller.model is not model:
             raise ValueError("model, estimator.model, and controller.model must match")
@@ -146,11 +160,8 @@ class RotationAwareMPCTracker:
         self.yaw_adapter = yaw_adapter
         self.fusion = fusion or build_default_staircase_fusion()
         self.thruster_allocator = thruster_allocator
-        self.baseline_adaptation = (
-            baseline_adaptation or BaselineAdaptationConfig()
-        )
-        self._yaw_moment_before_last = 0.0
         self._yaw_previous: float | None = None
+        self._previous_achieved_force: np.ndarray | None = None
         self._pending: deque[_PendingRotatingPrediction] = deque()
         self._frame_index = -1
 
@@ -162,9 +173,7 @@ class RotationAwareMPCTracker:
     ) -> None:
         force = vector3(force_achieved, "force_achieved")
         moment = finite_scalar(yaw_moment_achieved, "yaw_moment_achieved")
-        self.model.translation.set_tau_base(force)
         self.model.yaw.set_yaw_moment_base(moment)
-        self._yaw_moment_before_last = moment
         self._yaw_previous = (
             None if yaw_rad is None else finite_scalar(yaw_rad, "yaw_rad")
         )
@@ -174,6 +183,7 @@ class RotationAwareMPCTracker:
         self.yaw_controller.reset(yaw_rad)
         self._pending.clear()
         self._frame_index = -1
+        self._previous_achieved_force = force.copy()
 
     def target_lost(
         self,
@@ -201,8 +211,8 @@ class RotationAwareMPCTracker:
         self.controller.reset()
         self.yaw_controller.reset()
         self._pending.clear()
-        self._yaw_moment_before_last = achieved_moment
         self._yaw_previous = None
+        self._previous_achieved_force = None
         self._frame_index = -1
 
         yaw_channel = self.yaw_adapter.convert(moment)
@@ -211,59 +221,8 @@ class RotationAwareMPCTracker:
             yaw_moment=moment,
             yaw_channel=yaw_channel,
             device_command=self.force_adapter.convert(force),
-            status="target_lost:return_to_force_and_yaw_baseline",
+            status="target_lost:return_to_restoring_force_and_yaw_baseline",
         )
-
-    def _adapt_baseline_if_matched(
-        self,
-        state: np.ndarray,
-        force_achieved: np.ndarray,
-        reference_position,
-    ) -> None:
-        cfg = self.baseline_adaptation
-        if not cfg.enabled:
-            return
-        mode = str(cfg.update_mode).strip().lower()
-        if mode == "previous_force":
-            self.model.translation.tau_base = np.clip(
-                force_achieved,
-                self.controller.config.force_min,
-                self.controller.config.force_max,
-            )
-            return
-        if mode != "gated_ema":
-            raise ValueError(f"unsupported baseline update mode: {cfg.update_mode}")
-
-        reference = (
-            self.controller.config.reference_position
-            if reference_position is None
-            else vector3(reference_position, "reference_position")
-        )
-        steady_alpha = float(cfg.adaptation_rate)
-        transient_alpha = (
-            steady_alpha
-            if cfg.transient_adaptation_rate is None
-            else float(cfg.transient_adaptation_rate)
-        )
-        if not 0.0 < steady_alpha <= 1.0 or not 0.0 < transient_alpha <= 1.0:
-            raise ValueError("baseline adaptation rate must be in (0, 1]")
-
-        eligible = (
-            np.abs(state[:3] - reference) <= cfg.position_error_tolerance
-        ) & (np.abs(state[3:]) <= cfg.velocity_tolerance)
-        steady = (
-            np.abs(state[:3] - reference)
-            <= cfg.steady_position_error_tolerance
-        ) & (np.abs(state[3:]) <= cfg.steady_velocity_tolerance)
-        alpha = np.where(steady, steady_alpha, transient_alpha)
-        current = self.model.translation.tau_base
-        adapted = (1.0 - alpha) * current + alpha * force_achieved
-        adapted = np.clip(
-            adapted,
-            self.controller.config.force_min,
-            self.controller.config.force_max,
-        )
-        self.model.translation.tau_base = np.where(eligible, adapted, current)
 
     def _score_completed_predictions(
         self,
@@ -317,7 +276,7 @@ class RotationAwareMPCTracker:
         reference_position=None,
         roll_pitch_control=(0.0, 0.0),
         rotation_visibility_from_body=None,
-        camera_origin_in_body=(0.0, 0.0, 0.0),
+        camera_origin_in_body=None,
     ) -> YawTrackerOutput:
         force = vector3(force_achieved_previous, "force_achieved_previous")
         yaw = finite_scalar(yaw_rad, "yaw_rad")
@@ -329,10 +288,18 @@ class RotationAwareMPCTracker:
         if roll_pitch.shape != (2,) or not np.all(np.isfinite(roll_pitch)):
             raise ValueError("roll_pitch_control must be finite with shape (2,)")
         visibility_rotation, camera_origin = visibility_frame_geometry(
-            rotation_visibility_from_body,
-            camera_origin_in_body,
+            self.controller.config.rotation_visibility_from_body
+            if rotation_visibility_from_body is None
+            else rotation_visibility_from_body,
+            self.controller.config.camera_origin_in_body
+            if camera_origin_in_body is None
+            else camera_origin_in_body,
         )
-        tau_base_for_interval = self.model.translation.tau_base.copy()
+        tau_base_for_interval = (
+            force.copy()
+            if self._previous_achieved_force is None
+            else self._previous_achieved_force.copy()
+        )
 
         self._frame_index += 1
         if not self.estimator.initialized:
@@ -367,9 +334,8 @@ class RotationAwareMPCTracker:
             self._score_completed_predictions(state[:3], force, delta_yaw)
 
         self._yaw_previous = yaw
-        self._yaw_moment_before_last = yaw_moment
-        self._adapt_baseline_if_matched(state, force, reference_position)
-        self._start_prediction(state, self.model.translation.tau_base)
+        self._previous_achieved_force = force.copy()
+        self._start_prediction(state, force)
         position_visibility = body_to_visibility_position(
             state[:3],
             visibility_rotation,

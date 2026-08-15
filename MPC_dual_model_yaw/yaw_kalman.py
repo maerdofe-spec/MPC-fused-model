@@ -7,7 +7,7 @@ import numpy as np
 from MPC_dual_model.fossen_fixed_dl_model import vector3
 from MPC_dual_model.relative_kalman import KalmanConfig
 
-from .yaw_relative_model import RotationAwareRelativeModel
+from .yaw_relative_model import RotationAwareRelativeModel, rotation_state_matrix
 
 
 class RotationAwareKalmanFilter:
@@ -63,7 +63,7 @@ class RotationAwareKalmanFilter:
         self.x = transition @ self.x + input_matrix @ vector3(
             effective_force, "effective_force"
         )
-        self._predict_covariance(transition)
+        self._predict_covariance(transition, delta_yaw_rad)
         return self.x.copy()
 
     def predict_mean(self, predicted_state, delta_yaw_rad: float) -> np.ndarray:
@@ -75,11 +75,17 @@ class RotationAwareKalmanFilter:
             raise ValueError("predicted_state must be finite with shape (6,)")
         transition, _ = self.model.rotation_aware_matrices(delta_yaw_rad)
         self.x = mean.copy()
-        self._predict_covariance(transition)
+        self._predict_covariance(transition, delta_yaw_rad)
         return self.x.copy()
 
-    def _predict_covariance(self, transition: np.ndarray) -> None:
-        self.P = transition @ self.P @ transition.T + self.Q
+    def _predict_covariance(
+        self,
+        transition: np.ndarray,
+        delta_yaw_rad: float,
+    ) -> None:
+        rotation = rotation_state_matrix(delta_yaw_rad)
+        process_covariance = rotation @ self.Q @ rotation.T
+        self.P = transition @ self.P @ transition.T + process_covariance
         self.P = 0.5 * (self.P + self.P.T)
 
     def update(self, position_measurement) -> np.ndarray:

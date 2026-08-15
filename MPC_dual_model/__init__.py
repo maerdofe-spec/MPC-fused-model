@@ -34,6 +34,13 @@ from .mpc_tracker import (
     build_default_staircase_fusion,
 )
 from .relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+from .vision_measurement import (
+    PipelineJsonlTail,
+    VisionGateConfig,
+    VisionGateDecision,
+    VisionMeasurement,
+    VisionMeasurementGate,
+)
 
 __all__ = [
     "DeviceCommand",
@@ -43,10 +50,10 @@ __all__ = [
     "FINESUB_UNITY_THRUSTER_POSITIONS_BODY_M",
     "FINESUB_V4_PRO1_FORCE_NEGATIVE_N",
     "FINESUB_V4_PRO1_FORCE_POSITIVE_N",
-    "BaselineAdaptationConfig",
     "DEFAULT_PREDICTION_HORIZON_WEIGHTS",
     "DEFAULT_STAIRCASE_HORIZON_CAPS",
     "ALIGNED_OPENCV_TO_BODY",
+    "BaselineAdaptationConfig",
     "FixedLinearDampingRelativeModel",
     "ForceCommandAdapter",
     "FineSUBThrusterAllocator",
@@ -67,8 +74,13 @@ __all__ = [
     "MPCTracker",
     "RelativeMPCController",
     "RelativePositionKalmanFilter",
+    "PipelineJsonlTail",
     "SafeControlOutput",
     "TrackerOutput",
+    "VisionGateConfig",
+    "VisionGateDecision",
+    "VisionMeasurement",
+    "VisionMeasurementGate",
     "build_default_staircase_fusion",
     "camera_to_body_position",
 ]

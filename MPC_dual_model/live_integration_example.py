@@ -73,9 +73,9 @@ def build_tracker() -> MPCTracker:
         M_t=np.diag([26.07276, 26.79684, 26.07276]),
         D_L=np.diag([93.88006, 143.69195, 280.86849]),
         dt=0.05,
-        # Start without privileged environment knowledge. The observable
-        # matched-state update below learns the required equilibrium force.
-        tau_base=np.zeros(3),
+        # Replace this with the identified h(0) for a real vehicle.  It stays
+        # independent from the model-1 gated-EMA operating force below.
+        restoring_force=np.zeros(3),
     )
     config = MPCConfig(
         horizon=10,
@@ -135,13 +135,12 @@ def build_tracker() -> MPCTracker:
         thruster_allocator=allocator,
         baseline_adaptation=BaselineAdaptationConfig(
             enabled=True,
-            update_mode="gated_ema",
-            adaptation_rate=0.01,
-            transient_adaptation_rate=0.03,
+            adaptation_rate=0.02,
+            transient_adaptation_rate=0.08,
             steady_position_error_tolerance=0.03,
             steady_velocity_tolerance=0.02,
             position_error_tolerance=0.20,
-            velocity_tolerance=0.08,
+            velocity_tolerance=0.20,
         ),
     )
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CSRT target tracking + yaw-aware MPC + FineSUB real-vehicle transport."""
+"""Legacy joystick/manual + CSRT viewer for FineSUB.
+
+AUTO is permanently unavailable here.  Formal real-vehicle AUTO uses
+``finesub_auto_control.py`` and the external red-fish JSONL measurement gate.
+"""
 
 from __future__ import annotations
 
@@ -43,6 +47,7 @@ HORIZONTAL_HALF_FOV_DEG = 42.0
 VERTICAL_HALF_FOV_DEG = 30.0
 
 MANUAL_DEADBAND = 0.10
+LEGACY_AUTO_AVAILABLE = False
 
 MODEL_MODULES = {
     "model1": model1_live,
@@ -136,13 +141,20 @@ def manual_command(
     right_vertical: float,
     *,
     armed: bool,
+    translation_channel_limits=(0.10, 0.10, 0.10),
+    yaw_channel_limit: float = 0.10,
 ) -> FineSUBControlCommand:
     # FRD convention: stick up -> forward, stick right -> right/down/yaw-right.
+    limits = np.asarray(translation_channel_limits, dtype=float)
+    if limits.shape != (3,) or np.any(~np.isfinite(limits)) or np.any(limits <= 0.0):
+        raise ValueError("translation_channel_limits must be three positive values")
+    if not np.isfinite(yaw_channel_limit) or yaw_channel_limit <= 0.0:
+        raise ValueError("yaw_channel_limit must be positive")
     return FineSUBControlCommand(
-        forward=-0.35 * shaped_axis(left_vertical),
-        right=0.35 * shaped_axis(left_horizontal),
-        down=0.50 * shaped_axis(right_vertical),
-        yaw=0.20 * shaped_axis(right_horizontal),
+        forward=-float(limits[0]) * shaped_axis(left_vertical),
+        right=float(limits[1]) * shaped_axis(left_horizontal),
+        down=float(limits[2]) * shaped_axis(right_vertical),
+        yaw=float(yaw_channel_limit) * shaped_axis(right_horizontal),
         armed=armed,
     )
 
@@ -271,12 +283,12 @@ def main(
     command = zero_command(armed=False)
 
     print("Press S to select ROI, Z to stop tracking, Q to quit")
-    print("Button 7 arms/disarms; button 3 switches MANUAL/AUTO")
+    print("Button 7 arms/disarms; button 3 AUTO is permanently disabled here")
     print(f"[MPC] Selected model: {model_name}")
     print(f"[CONFIG] {Path(config_path).resolve()}")
     print(
-        "AUTO requires fresh telemetry, v3 execution feedback, and a matching "
-        "session/sequence/CRC command confirmation"
+        "This legacy program has no AUTO authority; formal AUTO uses the "
+        "separate fail-closed entry"
     )
 
     try:
@@ -316,9 +328,12 @@ def main(
                     connection.send(command)
                     print("[ARM]", "ON" if armed else "OFF")
                 elif event.button == 3:
-                    auto_mode = not auto_mode
+                    auto_mode = False
                     mpc_latched = False
-                    print("[MODE]", "AUTO" if auto_mode else "MANUAL")
+                    print(
+                        "[AUTO BLOCKED] Legacy joystick/CSRT AUTO is disabled; "
+                        "use finesub_auto_control.py"
+                    )
 
             left_h = left_v = right_h = right_v = 0.0
             if joystick is not None:
@@ -422,6 +437,10 @@ def main(
                         right_h,
                         right_v,
                         armed=True,
+                        translation_channel_limits=(
+                            hardware_adapter.translation_channel_limits
+                        ),
+                        yaw_channel_limit=hardware_adapter.yaw_channel_limit,
                     )
                     status_text = "MANUAL"
                 elif telemetry is None:

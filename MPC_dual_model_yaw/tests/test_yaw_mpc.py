@@ -23,11 +23,12 @@ from MPC_dual_model_yaw.yaw_relative_model import (
 
 
 class YawMPCTest(unittest.TestCase):
-    def build(self):
+    def build(self, restoring_force=(0.0, 0.0, 0.0)):
         translation = FixedLinearDampingRelativeModel(
             np.diag([20.0, 25.0, 30.0]),
             np.diag([8.0, 10.0, 12.0]),
             0.1,
+            restoring_force=restoring_force,
         )
         yaw = LinearYawDynamics(2.0, 0.8, translation.dt)
         model = RotationAwareRelativeModel(translation, yaw)
@@ -105,8 +106,9 @@ class YawMPCTest(unittest.TestCase):
             atol=0.0,
         )
 
-    def test_fused_prediction_uses_model1_only_tau_base(self) -> None:
-        model, controller, yaw_controller = self.build()
+    def test_fused_prediction_uses_tau_base_and_fossen_tau_h(self) -> None:
+        restoring = np.array([0.2, -0.1, 0.7])
+        model, controller, yaw_controller = self.build(restoring)
         reference = controller.config.reference_position
         previous = np.array([3.0, -2.0, 1.0])
         tau_base = np.array([1.0, 0.5, -0.4])
@@ -126,7 +128,7 @@ class YawMPCTest(unittest.TestCase):
         ).reshape(controller.config.horizon, controller.AUGMENTED_DIM)
 
         expected_velocity = model.translation.G @ (
-            previous - weight * tau_base
+            previous - weight * tau_base - (1.0 - weight) * restoring
         )
         np.testing.assert_allclose(free[0, 3:6], expected_velocity, atol=1.0e-12)
         np.testing.assert_allclose(
@@ -134,6 +136,47 @@ class YawMPCTest(unittest.TestCase):
             model.dt * expected_velocity,
             atol=1.0e-12,
         )
+
+    def test_solve_latches_previous_force_as_fixed_tau_base(self) -> None:
+        _, controller, yaw_controller = self.build(restoring_force=(0.0, 0.0, 0.8))
+        previous = np.array([0.3, -0.2, 0.9])
+        prediction = yaw_controller.update(
+            0.0, 0.0, 0.0, 0.0, controller.config.horizon
+        ).prediction
+        captured = []
+        original = controller._build_prediction_matrices
+
+        def capture(reference, weight, yaw, tau_base):
+            captured.append(np.asarray(tau_base).copy())
+            return original(reference, weight, yaw, tau_base)
+
+        controller._build_prediction_matrices = capture
+        controller.solve(
+            state=np.concatenate((controller.config.reference_position, np.zeros(3))),
+            force_previous=previous,
+            yaw_prediction=prediction,
+            model1_weight=(0.8, 0.8, 0.8),
+        )
+        self.assertEqual(len(captured), 1)
+        np.testing.assert_allclose(captured[0], previous)
+
+    def test_force_cost_is_always_absolute_total_force(self) -> None:
+        _, controller, yaw_controller = self.build()
+        self.assertFalse(hasattr(controller.config, "force_cost_mode"))
+        prediction = yaw_controller.update(
+            0.0, 0.0, 0.0, 0.0, controller.config.horizon
+        ).prediction
+        controller._build_prediction_matrices(
+            controller.config.reference_position,
+            np.array([0.8, 0.8, 0.8]),
+            prediction,
+            np.zeros(3),
+        )
+        free = np.zeros(controller.config.horizon * controller.AUGMENTED_DIM)
+        for step in range(controller.config.horizon):
+            free[step * controller.AUGMENTED_DIM + 6] = 2.0
+        _, gradient = controller._cost(free)
+        self.assertGreater(gradient[0], 0.0)
 
     def test_planar_allocator_reproduces_wrench_without_roll_or_pitch(self) -> None:
         allocation = finesub_planar_wrench_thruster_force_matrix()

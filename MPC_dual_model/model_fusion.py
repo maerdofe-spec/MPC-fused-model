@@ -17,12 +17,13 @@ except ImportError:
 class FusionConfig:
     """Settings for correlated-error least-squares model weights.
 
-    model-1: x+ = A x + B (tau - tau_base)
-    model-2: x+ = A x + B tau
+    model-1: x+ = A x + B (tau - tau_base,k)
+    model-2: x+ = A x + B (tau - tau_h)
 
-    Each axis has an independent model-1 weight a1; model-2 uses 1-a1.
-    ``tau_base`` is held separately by the tracker and is only used in the
-    model-1 branch.
+    At each prediction origin ``tau_base,k`` is the current gated-EMA
+    matched-motion force and remains fixed for that candidate's complete
+    horizon. ``tau_h`` is the independent fixed Fossen restoring/environment
+    balance force.
 
     ``window`` is the number of recent prediction start times to retain.
     Each start time generates one position residual for every completed step up
@@ -49,6 +50,11 @@ class FusionConfig:
     indistinguishable_score_threshold: object = (1.0e-7, 1.0e-7, 1.0e-7)
     minimum_weight: float = 0.05
     initial_model1_weight: object = (0.80, 0.80, 0.80)
+    # Optional diagnostic/AB override.  When supplied, the selected axes are
+    # held at this model-1 weight after every score update.  This is used for
+    # a pure-model-2 isolation run without abusing the indistinguishable-data
+    # threshold or changing the model equations.
+    fixed_model1_weight: object | None = None
     position_error_clip: object = (0.50, 0.50, 0.50)
     # Optional staircase mask. Entry r-1 is the largest retained prediction
     # horizon for an origin that is r control periods old. None preserves the
@@ -92,6 +98,11 @@ class FusionConfig:
         self.initial_model1_weight = vector3(
             self.initial_model1_weight, "initial_model1_weight"
         )
+        if self.fixed_model1_weight is not None:
+            fixed = vector3(self.fixed_model1_weight, "fixed_model1_weight")
+            if np.any(~np.isfinite(fixed)) or np.any(fixed < 0.0) or np.any(fixed > 1.0):
+                raise ValueError("fixed_model1_weight must be in [0,1]")
+            self.fixed_model1_weight = fixed
         if self.velocity_error_clip is not None:
             self.position_error_clip = self.velocity_error_clip
         self.position_error_clip = vector3(
@@ -133,6 +144,8 @@ class FusionConfig:
         self.initial_model1_weight = np.clip(
             self.initial_model1_weight, lower, upper
         )
+        if self.fixed_model1_weight is not None:
+            self.initial_model1_weight = self.fixed_model1_weight.copy()
         return self
 
 
@@ -165,6 +178,11 @@ class OnlineModelFusion:
         self.M1 = np.zeros(3)
         self.M2 = np.zeros(3)
         self.C12 = np.zeros(3)
+        self.candidate_difference = np.zeros(3)
+        self.indistinguishable = np.ones(3, dtype=bool)
+        self.window_count = 0
+        self.window_valid_count = np.zeros(3, dtype=int)
+        self.window_rejected_count = np.zeros(3, dtype=int)
 
     @property
     def model2_weight(self) -> np.ndarray:
@@ -192,33 +210,78 @@ class OnlineModelFusion:
         self.M1.fill(0.0)
         self.M2.fill(0.0)
         self.C12.fill(0.0)
+        self.candidate_difference.fill(0.0)
+        self.indistinguishable.fill(True)
+        self.window_count = 0
+        self.window_valid_count.fill(0)
+        self.window_rejected_count.fill(0)
 
     def _set_scores(
         self,
         errors1: np.ndarray,
         errors2: np.ndarray,
         weights: np.ndarray,
+        valid_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         weights = np.asarray(weights, dtype=float).reshape(-1)
         if weights.size == 0 or np.sum(weights) <= 0.0:
             return self.model1_weight.copy()
-        weights = weights / np.sum(weights)
-        self.M1 = np.sum(weights[:, None] * errors1**2, axis=0)
-        self.M2 = np.sum(weights[:, None] * errors2**2, axis=0)
-        self.C12 = np.sum(weights[:, None] * errors1 * errors2, axis=0)
+        if errors1.ndim != 2 or errors2.shape != errors1.shape:
+            raise ValueError("fusion errors must have shape (samples, axes)")
+        if errors1.shape[1] != 3 or weights.size != errors1.shape[0]:
+            raise ValueError("fusion errors/weights have incompatible shapes")
+        if valid_mask is None:
+            valid_mask = np.ones(errors1.shape, dtype=bool)
+        else:
+            valid_mask = np.asarray(valid_mask, dtype=bool)
+            if valid_mask.shape != errors1.shape:
+                raise ValueError("valid_mask must match fusion error shape")
 
+        previous_m1 = self.M1.copy()
+        previous_m2 = self.M2.copy()
+        previous_c12 = self.C12.copy()
+        previous_difference = self.candidate_difference.copy()
+        previous_weight = self.model1_weight.copy()
+        self.M1 = previous_m1.copy()
+        self.M2 = previous_m2.copy()
+        self.C12 = previous_c12.copy()
+        self.candidate_difference = previous_difference.copy()
+        normalized_weights = weights / np.sum(weights)
+        effective_mask = valid_mask & (normalized_weights[:, None] > 0.0)
+        for axis in range(3):
+            mask = effective_mask[:, axis]
+            if not np.any(mask):
+                continue
+            axis_weights = normalized_weights[mask]
+            axis_weights = axis_weights / np.sum(axis_weights)
+            self.M1[axis] = np.sum(axis_weights * errors1[mask, axis] ** 2)
+            self.M2[axis] = np.sum(axis_weights * errors2[mask, axis] ** 2)
+            self.C12[axis] = np.sum(
+                axis_weights * errors1[mask, axis] * errors2[mask, axis]
+            )
+
+        has_valid_axis = np.any(effective_mask, axis=0)
         denominator = self.M1 + self.M2 - 2.0 * self.C12
+        denominator = np.maximum(denominator, 0.0)
+        # An axis with no usable identification windows has no new score. Keep
+        # its last diagnostics and, more importantly, do not apply the last
+        # raw ratio repeatedly as if it were a fresh observation.
+        self.candidate_difference = np.where(
+            has_valid_axis, denominator, previous_difference
+        )
         raw = (self.M2 - self.C12 + self.config.epsilon) / (
             denominator + 2.0 * self.config.epsilon
         )
         # A nearly zero denominator means the current data cannot distinguish
-        # the two models. Model 1 is the physically preferred neutral model in
-        # this regime because tau_base represents the already-explained
-        # matched-speed equilibrium. Pulling toward its upper bound prevents a
-        # transient reversal from permanently leaving a steady axis on model 2.
+        # the models.  The PDF supplies no evidence-based preference in that
+        # case, so preserve the previous weight instead of manufacturing a
+        # model-1 observation.
         indistinguishable = denominator <= self.config.indistinguishable_score_threshold
+        indistinguishable = np.where(has_valid_axis, indistinguishable, True)
+        self.indistinguishable = indistinguishable.copy()
         lower = self.config.minimum_weight
-        raw = np.where(indistinguishable, 1.0 - lower, raw)
+        raw = np.where(indistinguishable, previous_weight, raw)
+        raw = np.where(has_valid_axis, raw, previous_weight)
         raw = np.clip(raw, lower, 1.0 - lower)
         rate = self.config.weight_update_rate
         self.model1_weight = np.clip(
@@ -226,6 +289,8 @@ class OnlineModelFusion:
             lower,
             1.0 - lower,
         )
+        if self.config.fixed_model1_weight is not None:
+            self.model1_weight = self.config.fixed_model1_weight.copy()
         return self.model1_weight.copy()
 
     def advance_time(self, current_index: int) -> np.ndarray:
@@ -255,6 +320,9 @@ class OnlineModelFusion:
             (sample.origin_index, sample.target_index) for sample in active
         )
         if not active:
+            self.window_count = 0
+            self.window_valid_count.fill(0)
+            self.window_rejected_count.fill(0)
             return self.model1_weight.copy()
 
         weights = []
@@ -272,7 +340,50 @@ class OnlineModelFusion:
             weights.append(recency_weight * horizon_weight)
         errors1 = np.asarray([sample.error1 for sample in active])
         errors2 = np.asarray([sample.error2 for sample in active])
-        return self._set_scores(errors1, errors2, np.asarray(weights))
+        weights_array = np.asarray(weights)
+
+        # A prediction origin is one identification window.  Evaluate the
+        # candidate gap inside each origin window first, then exclude only the
+        # weak windows from the aggregate least-squares update.  This is
+        # intentionally different from rejecting the entire aggregate when
+        # one recent horizon is close: with H=3 and window=6, five usable
+        # origins still contribute if one origin is ambiguous.
+        origin_ids = np.asarray([sample.origin_index for sample in active])
+        unique_origins = np.unique(origin_ids)
+        valid_mask = np.zeros(errors1.shape, dtype=bool)
+        valid_window_count = np.zeros(3, dtype=int)
+        rejected_window_count = np.zeros(3, dtype=int)
+        for origin in unique_origins:
+            cells = origin_ids == origin
+            local_weights = weights_array[cells]
+            local_weight_sum = float(np.sum(local_weights))
+            if not np.isfinite(local_weight_sum) or local_weight_sum <= 0.0:
+                # A window with no statistical weight is not usable evidence
+                # for any axis, even if its residual vectors are finite.
+                rejected_window_count += 1
+                continue
+            local_weights = local_weights / local_weight_sum
+            local_difference = np.sum(
+                local_weights[:, None]
+                * (errors1[cells] - errors2[cells]) ** 2,
+                axis=0,
+            )
+            accepted = (
+                local_difference
+                > self.config.indistinguishable_score_threshold
+            )
+            valid_mask[cells] = accepted
+            valid_window_count += accepted.astype(int)
+            rejected_window_count += (~accepted).astype(int)
+        self.window_count = int(unique_origins.size)
+        self.window_valid_count = valid_window_count
+        self.window_rejected_count = rejected_window_count
+        return self._set_scores(
+            errors1,
+            errors2,
+            weights_array,
+            valid_mask=valid_mask,
+        )
 
     def observe_position(
         self,

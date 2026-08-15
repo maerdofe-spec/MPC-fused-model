@@ -18,8 +18,8 @@ from MPC_dual_model.fossen_fixed_dl_model import (
 class FixedLinearDampingRelativeModel(_SharedFixedLinearDampingRelativeModel):
     """Three-axis model whose input is always the absolute body force.
 
-    ``tau_base`` is retained only as a safe fallback target for the controller;
-    it never enters the model-2 state prediction.
+    The shared parent retains ``tau_base`` for package compatibility, but this
+    model never reads it in state prediction or normal control.
     """
 
     def predict(self, p_rel, v_rel, tau) -> tuple[np.ndarray, np.ndarray]:

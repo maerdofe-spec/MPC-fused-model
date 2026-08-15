@@ -283,8 +283,10 @@ class RotationAwareRelativeModel:
         force_current,
         delta_yaw_rad: float,
     ) -> Array:
+        """Predict the target-stationary Fossen branch using ``tau-tau_h``."""
         return self.predict_translation(
             state_current_body,
-            vector3(force_current, "force_current"),
+            vector3(force_current, "force_current")
+            - self.translation.restoring_force,
             delta_yaw_rad,
         )

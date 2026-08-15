@@ -15,7 +15,7 @@ from rov_track_control3 import LiveModelBackend
 
 
 class AllHardwareAdaptersTest(unittest.TestCase):
-    def test_all_four_models_emit_finesub_v3_commands(self) -> None:
+    def test_all_four_models_emit_finesub_v4_commands(self) -> None:
         cases = (
             (model1_live, False),
             (model2_live, False),
@@ -98,14 +98,35 @@ class AllHardwareAdaptersTest(unittest.TestCase):
                 )
                 self.assertTrue(safe_command.armed)
                 self.assertEqual(safe_command.yaw_direct, yaw_direct)
-                np.testing.assert_array_equal(
+                expected_safe = (
+                    adapter.convert(
+                        np.array([0.0, 0.0, 0.80729]),
+                        0.0,
+                        armed=True,
+                        yaw_direct=True,
+                    )
+                    if name == "dual-yaw"
+                    else adapter.convert(
+                        np.zeros(3),
+                        0.0,
+                        armed=True,
+                        yaw_direct=yaw_direct,
+                    )
+                )
+                np.testing.assert_allclose(
                     [
                         safe_command.forward,
                         safe_command.right,
                         safe_command.down,
                         safe_command.yaw,
                     ],
-                    np.zeros(4),
+                    [
+                        expected_safe.forward,
+                        expected_safe.right,
+                        expected_safe.down,
+                        expected_safe.yaw,
+                    ],
+                    atol=1.0e-6,
                 )
 
     def test_all_backends_use_applied_motor_execution_feedback(self) -> None:
@@ -126,7 +147,7 @@ class AllHardwareAdaptersTest(unittest.TestCase):
             right=0.0,
             down=0.0,
             yaw=0.0,
-            applied_motor_throttle=(-0.1, 0.0, 0.0, -0.1, 0.1, 0.0, 0.0, 0.1),
+            applied_motor_throttle=(-0.1, -0.1, 0.0, 0.0, 0.0, -0.1, 0.1, 0.0),
             execution_feedback_valid=True,
         )
         for name in ("model1", "model2", "dual", "dual-yaw"):

@@ -18,9 +18,9 @@ from .finesub_protocol import (
     FineSUBControlCommand,
     FineSUBTelemetry,
     TelemetryStreamDecoder,
-    crc16_modbus,
     is_newer_telemetry,
     pack_command,
+    unpack_command_frame,
 )
 
 
@@ -183,9 +183,13 @@ class UdpTransport(FullDuplexTransport):
         bind_port: int,
         remote_host: str,
         remote_port: int,
+        command_datagram_size: int = 0,
+        telemetry_source_port: int = 0,
     ) -> None:
         self._bind_address = (str(bind_host), int(bind_port))
         self._remote_address = (str(remote_host), int(remote_port))
+        self._command_datagram_size = int(command_datagram_size)
+        self._telemetry_source_port = int(telemetry_source_port)
         self._socket: socket.socket | None = None
 
     def open(self) -> None:
@@ -209,13 +213,24 @@ class UdpTransport(FullDuplexTransport):
     def write(self, data: bytes) -> None:
         if self._socket is None:
             raise TransportError("UDP transport is closed")
+        wire_data = bytes(data)
+        if self._command_datagram_size:
+            if len(wire_data) + 1 > self._command_datagram_size:
+                raise TransportError(
+                    "command frame does not fit configured UDP datagram size"
+                )
+            wire_data = (
+                wire_data
+                + bytes(self._command_datagram_size - len(wire_data) - 1)
+                + b"\xBB"
+            )
         try:
-            sent = self._socket.sendto(data, self._remote_address)
+            sent = self._socket.sendto(wire_data, self._remote_address)
         except OSError as error:
             self.close()
             raise TransportError(str(error)) from error
-        if sent != len(data):
-            raise TransportError(f"short UDP write: {sent}/{len(data)}")
+        if sent != len(wire_data):
+            raise TransportError(f"short UDP write: {sent}/{len(wire_data)}")
 
     def read(self, max_bytes: int) -> bytes:
         if self._socket is None:
@@ -228,7 +243,9 @@ class UdpTransport(FullDuplexTransport):
             self.close()
             raise TransportError(str(error)) from error
         # Do not allow an arbitrary LAN sender to provide arming telemetry.
-        if sender[0] != self._remote_address[0] or sender[1] != self._remote_address[1]:
+        if sender[0] != self._remote_address[0]:
+            return b""
+        if self._telemetry_source_port and sender[1] != self._telemetry_source_port:
             return b""
         return data
 
@@ -256,6 +273,8 @@ def make_transport(config: dict) -> FullDuplexTransport:
             int(config.get("bind_port", 54321)),
             str(config.get("remote_host", "192.168.0.2")),
             int(config.get("remote_port", 58766)),
+            int(config.get("command_datagram_size", 0)),
+            int(config.get("telemetry_source_port", 0)),
         )
     raise ValueError("transport type must be tcp, udp, serial, or dry_run")
 
@@ -448,7 +467,7 @@ class FineSUBConnection:
             session_id=self.session_id,
             sender_time_ms=sender_time_ms,
         )
-        frame_crc = crc16_modbus(frame[:-2])
+        frame_crc = unpack_command_frame(frame).crc
         try:
             self.transport.write(frame)
         except TransportError as error:

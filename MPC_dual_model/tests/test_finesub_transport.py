@@ -8,9 +8,14 @@ from MPC_dual_model.finesub_protocol import (
     FineSUBControlCommand,
     FineSUBTelemetry,
     pack_telemetry,
+    pack_command,
     unpack_command_frame,
 )
-from MPC_dual_model.finesub_transport import DryRunTransport, FineSUBConnection
+from MPC_dual_model.finesub_transport import (
+    DryRunTransport,
+    FineSUBConnection,
+    UdpTransport,
+)
 
 
 def telemetry_for_command(envelope, *, accepted=True):
@@ -45,6 +50,34 @@ def telemetry_for_command(envelope, *, accepted=True):
 
 
 class FineSUBTransportTest(unittest.TestCase):
+    def test_udp_sends_native_37_byte_nx_command_unchanged(self) -> None:
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.datagram = b""
+
+            def sendto(self, data, _address):
+                self.datagram = bytes(data)
+                return len(data)
+
+        transport = UdpTransport(
+            "192.168.0.10",
+            54321,
+            "192.168.0.2",
+            58766,
+            command_datagram_size=0,
+        )
+        fake = FakeSocket()
+        transport._socket = fake
+        frame = pack_command(
+            FineSUBControlCommand(0.0, 0.0, 0.0, 0.0, False),
+            1,
+        )
+        transport.write(frame)
+        self.assertEqual(len(fake.datagram), 37)
+        self.assertEqual(fake.datagram, frame)
+        self.assertEqual(fake.datagram[:2], b"\xAA\x00")
+        self.assertEqual(fake.datagram[-1], 0xBB)
+
     def test_new_session_requires_confirmed_disarmed_frame(self) -> None:
         transport = DryRunTransport()
         link = FineSUBConnection(

@@ -23,6 +23,7 @@ htmlcov/
 *.log
 *.tmp
 *.bak
+calibration_logs/
 
 # Local configuration and secrets
 .env
@@ -34,4 +35,3 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
-

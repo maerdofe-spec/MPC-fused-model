@@ -18,11 +18,12 @@ from MPC_dual_model_yaw.yaw_relative_model import (
 
 
 class RotationModelTest(unittest.TestCase):
-    def build(self):
+    def build(self, restoring_force=(0.0, 0.0, 0.0)):
         translation = FixedLinearDampingRelativeModel(
             np.diag([20.0, 25.0, 30.0]),
             np.diag([8.0, 10.0, 12.0]),
             0.05,
+            restoring_force=restoring_force,
         )
         yaw = LinearYawDynamics(2.5, 1.2, translation.dt)
         return translation, RotationAwareRelativeModel(translation, yaw)
@@ -73,6 +74,19 @@ class RotationModelTest(unittest.TestCase):
             tau_base,
             delta_yaw_rad=0.03,
         )
+        np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+    def test_model2_subtracts_fixed_fossen_restoring_force(self) -> None:
+        restoring = np.array([0.0, 0.0, 0.80729])
+        _, model = self.build(restoring)
+        state = np.array([1.0, 0.2, -0.1, 0.1, -0.03, 0.02])
+        force = np.array([0.4, -0.2, 1.1])
+        expected = model.predict_translation(
+            state,
+            force - restoring,
+            delta_yaw_rad=0.03,
+        )
+        actual = model.predict_model2(state, force, delta_yaw_rad=0.03)
         np.testing.assert_allclose(actual, expected, atol=1.0e-12)
 
     def test_yaw_step_uses_trapezoidal_integration(self) -> None:

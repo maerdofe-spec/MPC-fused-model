@@ -1,6 +1,7 @@
-# yaw 旋转版仿真、标定和参数确认清单
+# yaw 旋转版实机候选、标定和参数确认清单
 
-本清单已按当前代码逐个配置项核对。已填数值来自当前 UnderwaterVision 仿真，不能直接用于实机。
+本清单已按当前代码逐个配置项核对。平移参数读取当前 FineSUB 实机实验块；yaw 动力学、
+六轴几何和上层双环 PID 仍是未获准正式控制的候选，不能据此跳过低限幅验证。
 
 - **测量/辨识**：应由尺寸、传感器、系泊或水池试验得到；
 - **实验整定**：需在仿真和低限幅水池试验中逐步调节；
@@ -32,12 +33,13 @@
 - [ ] 用开环或系泊试验验证由 `M_t,D_L,dt` 得到的离散 `F,G` 的一步和多步预测误差。
 - [ ] 判断实际工作速度下二次平移阻尼是否可忽略。当前代码没有 `D_Q`；若不可忽略，
   应先扩展模型，不能仅靠调大 `D_L` 掩盖。
-- [ ] 验证 `tau_base` 在线更新：初值为 0，逐轴满足 `0.20 m/0.08 m/s` 门限时更新；
-  普通更新率 0.03，满足 `0.03 m/0.02 m/s` 稳态门限时更新率 0.01。
+- [x] `tau_base,k=tau_achieved,k-1`：每次求解直接锁存上一实际力并在本次 horizon 内
+  固定；旧 gated EMA 已删除。验证执行回显的时间索引和单位正确即可。
 - [ ] 辨识有效 yaw 惯量 `effective_inertia=m_omega=I_z-N_rdot`，单位 kg·m²。
 - [ ] 辨识线性 yaw 阻尼 `linear_damping=d_omega`，单位 N·m/(rad/s)。
-- [x] Unity 暂定值：`effective_inertia=0.8 kg*m²`、
-  `linear_damping=0.8 N*m/(rad/s)`；由闭环力矩/IMU 数据估计，仍需开环试验复核。
+- [x] 当前实机候选：`effective_inertia=0.33453415 kg*m²`、
+  `linear_damping=0.32251723 N*m/(rad/s)`；置信度中低，仍为
+  `enabled_for_control=false`。
 - [ ] 辨识二次 yaw 阻尼 `quadratic_damping=d_omega2`；若数据不足暂设 0，必须同时限制
   工作角速度并记录适用范围。
 - [ ] 测量持续 yaw 偏置力矩/扰动力矩；当前模型没有 `d_N` 估计器，若偏置明显应补充
@@ -65,14 +67,16 @@
 - [ ] `weight_update_rate=0.35`：检查模型权重平滑速度能否兼顾转向瞬态与稳态辨识。
 - [ ] `minimum_weight=0.01`：决定是否保留双模型最低占比；它使代码不能得到 0/1
   纯模型权重，与 PDF 公式不同。
-- [ ] `initial_model1_weight=(0.8,0.8,0.8)`：由无历史数据时更可信的模型决定。
+- [ ] 当前实机 `initial_model1_weight=(0.8,0.8,0.99)`：由无历史数据时更可信的模型决定。
 - [ ] 验证所有启用格子的权重归一化、当前拍更新次序和三轴权重变化符合实验预期。
 
 ## E. yaw 状态机与双环 PID（实验整定/设计选择）
 
-当前 Unity 正方形轨迹组：`alpha_on/off/emergency=1.8/0.7/4.5 deg`，
-`outer_kp/kd=4.0/0.8`，`inner_kp/ki=2.0/0.1`，最大角速度 `45 deg/s`，
-最大角加速度 `90 deg/s²`，力矩/变化率限额 `1.5/0.25 N*m`。
+当前保守候选：`alpha_on/off/emergency=3.0/1.2/8.0 deg`，
+`outer_kp/kd=1.5/0.2`，`inner_kp/ki=0.60/0.02`，最大角速度 `30 deg/s`，
+最大角加速度 `60 deg/s²`；力矩绝对限额来自实机通道映射
+`-2.041126..+1.807854 N*m`，每个 `0.10 s` 周期变化 `+-0.50 N*m`。这些 PID 数值尚未
+水池闭环验证。
 
 - [ ] `alpha_on`：正常平移跟踪仍可靠、但需要开始转头的视线角阈值。
 - [ ] `alpha_off`：必须小于 `alpha_on`，形成回差，避免反复切换。
@@ -97,12 +101,10 @@
 - [ ] `position_weights`、`velocity_weights`：逐轴确定位置和相对速度优先级。
 - [ ] `terminal_weight_scale`：当前同时缩放位置与速度终端权重，不能独立设置。
 - [ ] `force_weights`、`delta_force_weights`：在跟踪、能耗和控制平滑性之间整定。
-- [ ] `force_cost_mode`：默认 `effective` 与 PDF 的绝对力代价不同；只有明确选择逐字
-  复现 PDF 时才设为 `absolute`。
-- [x] QP 已同步 V4 Pro1 八推进器逐台非对称限额，并以八台推进器力为变量执行完整
-  六轴等式。用于数值限幅的三轴外包范围为 `Fx/Fright=+-20.9251 N`、
-  `Fdown=-31.7116..27.4736 N`；真实联合边界由六轴等式和逐台限额决定，不能按三轴
-  独立盒约束理解。
+- [x] 力代价固定为 PDF 的绝对总力；旧 `effective-force` 模式和开关已删除。
+- [x] 三轴数值限额读取当前实验块：最小 `[-5.050680,-4.783308,-6.867140] N`，最大
+  `[4.730162,4.997534,7.063140] N`；QP 同时保留实机 M1..M8 四轴平移+yaw 等式。逐桨限额目前是旧
+  全油门曲线按 `0.20` 通道缩放的先验，不是实测联合可达域。
 - [ ] `delta_force_min/max`：三轴每周期力变化限值。
 - [ ] `forward_distance_min/max`：可测距离、碰撞安全距离和任务距离范围。
 - [ ] `horizontal_half_fov_deg`、`vertical_half_fov_deg`：使用实际有效视场半角，不只照抄
@@ -112,8 +114,8 @@
 - [ ] `slack_quadratic_weight`、`slack_linear_weight`、`slack_max`：用可恢复越界和严重
   越界场景整定。
 - [ ] 记录 OSQP `rho`、`sigma`、`max_iterations`、绝对/相对容差、终止检查周期和时间
-  限制；用目标硬件验证平均、95% 分位和最坏求解时间均满足 20 Hz 预算。
-- [ ] 人为制造不可行、超时和数值失败，验证输出按限速返回上次可行力或锁存基线，
+  限制；用目标硬件验证平均、95% 分位和最坏求解时间均满足 10 Hz 预算。
+- [ ] 人为制造不可行、超时和数值失败，验证输出按限速返回上次可行力或固定 `tau_h`，
   而不是突变为零力。
 
 ## G. 力/力矩通道和控制分配（测量/辨识）
@@ -123,6 +125,8 @@
 - [ ] `ForceCommandAdapter.command_limits`：与下位机协议的整数通道范围一致。
 - [ ] `YawMomentChannelAdapter.positive_yaw_moment_at_limit`：测量正 yaw 通道限值对应的
   实际力矩。
+- [ ] `YawMomentChannelAdapter.negative_yaw_moment_at_limit`：单独测量负 yaw 通道限值，
+  不假设正反对称。
 - [ ] `YawMomentChannelAdapter.channel_limit` 和 `sign`：与下位机 yaw 通道范围、符号一致。
 - [ ] `FineSUBThrusterAllocator.positive_force_at_limit`：与平移通道标定保持一致。
 - [ ] `translation_channel_limits`、`attitude_channel_limits`：按供电、温升和同时动作时的
@@ -132,14 +136,17 @@
 - [ ] 逐个验证八路电机编号、旋向、符号和代码混控矩阵与固件当前版本一致。
 - [ ] 标定真实推力曲线、正反推力不对称、电压影响、流速影响和推进器互扰；当前转换
   只采用线性对称比例。
-- [x] 当前 QP 已将平移、零 roll/pitch 力矩和冻结 yaw 力矩共同放入完整六自由度
-  推进器约束，并保留八推进器零空间；仍需用实机几何和质心复核 `W_6x8`。
+- [x] 当前 QP 已将平移和冻结 yaw 力矩共同放入实机 M1..M8 四轴推进器约束，并保留
+  八推进器零空间；没有用未知质心伪造 roll/pitch 力矩行。
+- [ ] 增加下位机 roll/pitch PID 实际输出/需求遥测，或建立保守余量，之后才能把姿态
+  占用纳入联合可达域。
 - [ ] 只能选择“发送高层力/姿态通道”或“Python 直接发送电机输出”一种执行链路，
   避免与 MCU 重复混控。
 
 ## H. 安全逻辑与上水顺序
 
-- [ ] 确定启动时锁存的 `tau_base`、`yaw_moment_base`，并验证它们在目标丢失时安全。
+- [ ] 验证启动时上一实际力能正确成为首个 `tau_base`；目标丢失时平移应限速退回固定
+  `tau_h`，yaw 力矩退回 `yaw_moment_base`。
 - [ ] 明确视觉丢失、时间戳异常、IMU 无效、连续 QP 失败和通信中断的退出阈值。
 - [ ] 完成全部单元测试和无硬件闭环仿真。
 - [ ] 固定机体，低限幅逐轴验证 `Fx/Fy/Fz/N` 符号和实际执行反馈符号。

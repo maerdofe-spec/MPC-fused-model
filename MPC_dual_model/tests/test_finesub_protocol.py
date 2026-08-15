@@ -4,9 +4,12 @@ from dataclasses import replace
 import numpy as np
 
 from MPC_dual_model.finesub_protocol import (
+    COMMAND_SYNC,
+    COMMAND_TAIL,
     COMMAND_STATUS_ACCEPTED,
     COMMAND_FRAME_SIZE,
     TELEMETRY_FRAME_SIZE,
+    FineSUBControlCommand,
     FineSUBHardwareAdapter,
     FineSUBTelemetry,
     TelemetryStreamDecoder,
@@ -23,8 +26,136 @@ from MPC_dual_model.finesub_protocol import (
 
 
 class FineSUBProtocolTest(unittest.TestCase):
+    @staticmethod
+    def _rpm_adapter(force_limit=10.0) -> FineSUBHardwareAdapter:
+        return FineSUBHardwareAdapter(
+            use_rpm_for_force_estimate=True,
+            rpm_c1_positive=[1.0] * 8,
+            rpm_c1_negative=[1.0] * 8,
+            rpm_force_directions_frd=[
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            rpm_yaw_moment_arms=[0.2, -0.2, 0.0, 0.0, 0.0, 0.2, -0.2, 0.0],
+            rpm_positive_force_limit=[force_limit] * 8,
+            rpm_negative_force_limit=[force_limit] * 8,
+        )
+
     def test_crc_matches_modbus_reference_vector(self) -> None:
         self.assertEqual(crc16_modbus(b"123456789"), 0x4B37)
+
+    def test_physical_motor_calibration_command_round_trips_and_is_limited(self) -> None:
+        command = FineSUBControlCommand(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            armed=True,
+            calibration_motor_index=4,
+            calibration_motor_throttle=0.10,
+        )
+        decoded = unpack_command_frame(
+            pack_command(command, 7, session_id=9, sender_time_ms=11)
+        )
+        self.assertTrue(decoded.command.armed)
+        self.assertEqual(decoded.command.calibration_motor_index, 4)
+        self.assertAlmostEqual(decoded.command.calibration_motor_throttle, 0.10)
+        with self.assertRaises(ValueError):
+            FineSUBControlCommand(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                armed=True,
+                calibration_motor_index=4,
+                calibration_motor_throttle=0.1001,
+            )
+
+    def test_calibration_channel_command_round_trips_and_is_limited(self) -> None:
+        command = FineSUBControlCommand(
+            0.05,
+            -0.075,
+            0.10,
+            -0.05,
+            armed=True,
+            calibration_channel=True,
+        )
+        decoded = unpack_command_frame(
+            pack_command(command, 8, session_id=10, sender_time_ms=12)
+        )
+        self.assertTrue(decoded.command.armed)
+        self.assertTrue(decoded.command.calibration_channel)
+        np.testing.assert_allclose(
+            (
+                decoded.command.forward,
+                decoded.command.right,
+                decoded.command.down,
+                decoded.command.yaw,
+            ),
+            (0.05, -0.075, 0.10, -0.05),
+            atol=1.0e-7,
+        )
+        with self.assertRaises(ValueError):
+            FineSUBControlCommand(
+                0.1001,
+                0.0,
+                0.0,
+                0.0,
+                armed=True,
+                calibration_channel=True,
+            )
+
+    def test_single_attitude_axis_calibration_round_trips(self) -> None:
+        for axis in ("roll", "pitch", "yaw"):
+            with self.subTest(axis=axis):
+                command = FineSUBControlCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    armed=True,
+                    yaw_direct=axis != "yaw",
+                    calibration_attitude_axis=axis,
+                )
+                decoded = unpack_command_frame(
+                    pack_command(command, 9, session_id=11, sender_time_ms=13)
+                )
+                self.assertEqual(decoded.command.calibration_attitude_axis, axis)
+        with self.assertRaises(ValueError):
+            FineSUBControlCommand(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                armed=True,
+                yaw_direct=False,
+                calibration_attitude_axis="pitch",
+            )
+        with self.assertRaises(ValueError):
+            FineSUBControlCommand(
+                0.01,
+                0.0,
+                0.0,
+                0.0,
+                armed=True,
+                calibration_attitude_axis="roll",
+            )
+        with self.assertRaises(ValueError):
+            FineSUBControlCommand(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                armed=True,
+                calibration_motor_index=1,
+                calibration_channel=True,
+            )
 
     def test_mpc_wrench_round_trips_through_normalized_channels(self) -> None:
         adapter = FineSUBHardwareAdapter()
@@ -36,6 +167,10 @@ class FineSUBProtocolTest(unittest.TestCase):
             sender_time_ms=123456,
         )
         self.assertEqual(len(frame), COMMAND_FRAME_SIZE)
+        self.assertEqual(COMMAND_FRAME_SIZE, 37)
+        self.assertEqual(frame[:2], COMMAND_SYNC)
+        self.assertEqual(frame[1], 0)
+        self.assertEqual(frame[-1], COMMAND_TAIL)
         decoded, sequence = unpack_command(frame)
         self.assertEqual(sequence, 0x1234)
         self.assertTrue(decoded.armed)
@@ -63,6 +198,40 @@ class FineSUBProtocolTest(unittest.TestCase):
         force, moment = adapter.achieved_wrench(telemetry)
         np.testing.assert_allclose(force, (10.0, -7.5, 3.0), atol=1.0e-6)
         self.assertAlmostEqual(moment, 2.0, places=6)
+
+    def test_asymmetric_wrench_scales_round_trip(self) -> None:
+        adapter = FineSUBHardwareAdapter(
+            positive_force_at_limit=(2.0, 3.0, 4.0),
+            negative_force_at_limit=(2.5, 3.5, 4.5),
+            translation_channel_limits=(0.10, 0.10, 0.10),
+            positive_yaw_moment_at_limit=0.8,
+            negative_yaw_moment_at_limit=1.0,
+            yaw_channel_limit=0.10,
+        )
+        command = adapter.convert((1.0, -1.75, 4.0), -0.5, armed=True)
+        np.testing.assert_allclose(
+            (command.forward, command.right, command.down, command.yaw),
+            (0.05, -0.05, 0.10, -0.05),
+        )
+        telemetry = FineSUBTelemetry(
+            sequence=1,
+            tick_ms=100,
+            state=2,
+            armed=True,
+            mpc_direct=True,
+            yaw_direct=True,
+            failsafe=False,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            depth_m=0.0,
+            forward=command.forward,
+            right=command.right,
+            down=command.down,
+            yaw=command.yaw,
+        )
+        force, moment = adapter.achieved_wrench(telemetry)
+        np.testing.assert_allclose(force, (1.0, -1.75, 4.0), atol=1.0e-6)
+        self.assertAlmostEqual(moment, -0.5, places=6)
 
     def test_stream_decoder_handles_noise_fragmentation_and_bad_crc(self) -> None:
         telemetry = FineSUBTelemetry(
@@ -97,7 +266,7 @@ class FineSUBProtocolTest(unittest.TestCase):
         self.assertGreaterEqual(decoder.dropped_bytes, 5)
         self.assertEqual(decoder.crc_errors, 1)
 
-    def test_full_v3_telemetry_round_trip(self) -> None:
+    def test_full_v4_telemetry_round_trip(self) -> None:
         telemetry = FineSUBTelemetry(
             sequence=17,
             tick_ms=9988,
@@ -137,6 +306,7 @@ class FineSUBProtocolTest(unittest.TestCase):
         self.assertTrue(decoded.execution_feedback_valid)
         self.assertTrue(decoded.rpm_available)
         self.assertEqual(decoded.rpm_valid_mask, 0xA5)
+        self.assertAlmostEqual(decoded.body_frd_yaw_rate_rad_s, 0.2)
         np.testing.assert_allclose(decoded.quat_wxyz, telemetry.quat_wxyz)
         np.testing.assert_allclose(decoded.motor_rpm, telemetry.motor_rpm)
 
@@ -146,24 +316,33 @@ class FineSUBProtocolTest(unittest.TestCase):
         roll_pitch = np.array([0.03, -0.04])
         lower_mixer = np.array(
             [
+                [-1.0, -1.0, -1.0],
+                [-1.0, -1.0, 1.0],
                 [1.0, -1.0, 1.0],
                 [-1.0, 1.0, 1.0],
-                [1.0, 1.0, -1.0],
-                [-1.0, -1.0, -1.0],
             ]
         )
         upper_mixer = np.array(
             [
-                [1.0, -1.0, -1.0],
+                [-1.0, 1.0, 1.0],
                 [1.0, 1.0, -1.0],
-                [-1.0, 1.0, -1.0],
-                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
             ]
         )
         lower = lower_mixer @ np.array([yaw, translation[0], translation[1]])
         upper = upper_mixer @ np.array([roll_pitch[0], roll_pitch[1], translation[2]])
         physical = np.array(
-            [lower[0], upper[0], -upper[1], -lower[1], lower[2], upper[2], upper[3], -lower[3]]
+            [
+                lower[0],
+                lower[1],
+                upper[0],
+                upper[1],
+                upper[2],
+                lower[2],
+                lower[3],
+                upper[3],
+            ]
         )
         reconstructed, reconstructed_yaw, reconstructed_roll_pitch = (
             motor_throttles_to_channels(physical)
@@ -197,6 +376,175 @@ class FineSUBProtocolTest(unittest.TestCase):
         )
         np.testing.assert_allclose(force, expected_force, atol=1e-6)
         self.assertAlmostEqual(moment, expected_moment, places=6)
+
+    def test_valid_rpm_reconstructs_achieved_force_and_yaw(self) -> None:
+        adapter = self._rpm_adapter()
+        one_rad_s_rpm = 60.0 / (2.0 * np.pi)
+        rpm = [0.0] * 8
+        rpm[0] = one_rad_s_rpm
+        rpm[2] = one_rad_s_rpm
+        telemetry = FineSUBTelemetry(
+            sequence=1,
+            tick_ms=2,
+            state=2,
+            armed=True,
+            mpc_direct=True,
+            yaw_direct=False,
+            failsafe=False,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            depth_m=0.0,
+            forward=0.2,
+            right=0.2,
+            down=0.2,
+            yaw=0.1,
+            motor_rpm=tuple(rpm),
+            rpm_available=True,
+            rpm_valid_mask=0xFF,
+        )
+        force, moment = adapter.achieved_wrench(telemetry)
+        np.testing.assert_allclose(force, (1.0, 0.0, 1.0), atol=1.0e-12)
+        self.assertAlmostEqual(moment, 0.2, places=12)
+        self.assertEqual(
+            adapter.last_achieved_wrench_diagnostics["force_axis_sources"],
+            ["rpm", "rpm", "rpm"],
+        )
+        self.assertEqual(
+            adapter.last_achieved_wrench_diagnostics["yaw_source"], "rpm"
+        )
+
+    def test_invalid_horizontal_rpm_group_falls_back_without_discarding_vertical(self) -> None:
+        adapter = self._rpm_adapter()
+        one_rad_s_rpm = 60.0 / (2.0 * np.pi)
+        rpm = [0.0] * 8
+        rpm[2] = one_rad_s_rpm
+        telemetry = FineSUBTelemetry(
+            sequence=1,
+            tick_ms=2,
+            state=2,
+            armed=True,
+            mpc_direct=True,
+            yaw_direct=False,
+            failsafe=False,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            depth_m=0.0,
+            forward=0.1,
+            right=-0.1,
+            down=0.2,
+            yaw=0.05,
+            motor_rpm=tuple(rpm),
+            rpm_available=True,
+            rpm_valid_mask=sum(1 << index for index in (2, 3, 4, 7)),
+        )
+        force, moment = adapter.achieved_wrench(telemetry)
+        command_force, command_moment = adapter._channels_to_wrench(
+            (0.1, -0.1, 0.2), 0.05
+        )
+        np.testing.assert_allclose(force[:2], command_force[:2])
+        self.assertAlmostEqual(force[2], 1.0, places=12)
+        self.assertAlmostEqual(moment, command_moment)
+        self.assertEqual(
+            adapter.last_achieved_wrench_diagnostics["force_axis_sources"],
+            ["command_echo", "command_echo", "rpm"],
+        )
+
+    def test_diagnostic_only_rpm_does_not_replace_applied_motor_force(self) -> None:
+        control_adapter = self._rpm_adapter()
+        control_adapter.use_rpm_for_force_estimate = False
+        control_adapter.log_rpm_force_estimate = True
+        one_rad_s_rpm = 60.0 / (2.0 * np.pi)
+        translation = np.array([0.12, -0.08, 0.25])
+        yaw = 0.06
+        lower_mixer = np.array(
+            [
+                [-1.0, -1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ]
+        )
+        upper_mixer = np.array(
+            [
+                [-1.0, 1.0, 1.0],
+                [1.0, 1.0, -1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+        physical = np.zeros(8)
+        physical[[0, 1, 5, 6]] = lower_mixer @ np.array(
+            [yaw, translation[0], translation[1]]
+        )
+        physical[[2, 3, 4, 7]] = upper_mixer @ np.array(
+            [0.0, 0.0, translation[2]]
+        )
+        rpm = [0.0] * 8
+        rpm[0] = one_rad_s_rpm
+        rpm[2] = one_rad_s_rpm
+        telemetry = FineSUBTelemetry(
+            sequence=1,
+            tick_ms=2,
+            state=2,
+            armed=True,
+            mpc_direct=True,
+            yaw_direct=False,
+            failsafe=False,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            depth_m=0.0,
+            forward=0.0,
+            right=0.0,
+            down=0.0,
+            yaw=0.0,
+            applied_motor_throttle=tuple(physical),
+            execution_feedback_valid=True,
+            motor_rpm=tuple(rpm),
+            rpm_available=True,
+            rpm_valid_mask=0xFF,
+        )
+        force, moment = control_adapter.achieved_wrench(telemetry)
+        expected_force, expected_moment = control_adapter._channels_to_wrench(
+            translation, yaw
+        )
+        np.testing.assert_allclose(force, expected_force, atol=1.0e-12)
+        self.assertAlmostEqual(moment, expected_moment, places=12)
+        self.assertEqual(
+            control_adapter.last_achieved_wrench_diagnostics["force_axis_sources"],
+            ["applied_motor_throttle"] * 3,
+        )
+        np.testing.assert_allclose(
+            control_adapter.last_achieved_wrench_diagnostics["rpm_force_frd_n"],
+            (1.0, 0.0, 1.0),
+            atol=1.0e-12,
+        )
+
+    def test_rpm_force_estimate_is_clamped_to_calibrated_curve_limit(self) -> None:
+        adapter = self._rpm_adapter(force_limit=2.0)
+        rpm = [0.0] * 8
+        rpm[0] = 1000.0
+        telemetry = FineSUBTelemetry(
+            sequence=1,
+            tick_ms=2,
+            state=2,
+            armed=True,
+            mpc_direct=True,
+            yaw_direct=False,
+            failsafe=False,
+            yaw_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            depth_m=0.0,
+            forward=0.0,
+            right=0.0,
+            down=0.0,
+            yaw=0.0,
+            motor_rpm=tuple(rpm),
+            rpm_available=True,
+            rpm_valid_mask=0xFF,
+        )
+        force, moment = adapter.achieved_wrench(telemetry)
+        np.testing.assert_allclose(force, (2.0, 0.0, 0.0))
+        self.assertAlmostEqual(moment, 0.4)
 
     def test_sequence_order_handles_duplicates_old_frames_and_wrap(self) -> None:
         self.assertTrue(is_newer_u16_sequence(11, 10))
