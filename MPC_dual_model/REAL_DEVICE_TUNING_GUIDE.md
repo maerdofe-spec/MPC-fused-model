@@ -358,6 +358,27 @@ horizon、Qv、R/S。
 
 ## 4. 每轮只看这些判据
 
+### 实机启动故障快速排查
+
+如果 AUTO 长时间停在 `DISARMED_HANDSHAKE`、没有 `ACTIVE` 和
+`control_update`，先不要改 MPC 参数，按下面顺序检查：
+
+1. 检查启动输出中的 `vision=` 路径是否是本次视觉程序正在追加的
+   `pipeline_results.jsonl`。旧运行目录不会产生新帧，会导致
+   `measurement_fresh=false`，AUTO 只保持 disarmed-zero。
+   这一步是强制项：不要直接使用 JSON 配置里的历史日期路径；必须把当前
+   正在增长的文件显式传给 `finesub_experimental_auto.py --vision-jsonl`，并
+   在预检输出中再次核对路径和文件尾部时间戳。
+2. 用只读 `calibration_tool link` 确认 `telemetry_fresh=1`、
+   `execution_feedback_valid=1`、`telemetry_mpc_direct=1`，以及遥控模式与
+   本次模型一致（平移模型要求 `telemetry_yaw_direct=0`/`LOCAL_HOLD`）。
+3. UDP 实验实际使用 `transport.remote_host`（当前为 `192.168.0.2`）和
+   `remote_port`；不要用配置中仅供旧 TCP 的 `transport.host`
+   (`192.168.138.2`) 判断 UDP 是否可达。
+4. 只有视觉路径和下位机模式都确认后，才重新启动
+   `finesub_experimental_auto.py --execute`；这些握手/时效故障不能靠调 Q/R
+   或提高限幅解决。
+
 这些是调参比较指标，不是额外的 AUTO 强制退出条件：
 
 - 视觉有效段接受率、采集间隔 P50/P95/P99 和连续缺口长度；

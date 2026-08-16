@@ -176,6 +176,26 @@ class FixedLinearDampingRelativeModel:
         if np.max(np.abs(np.linalg.eigvals(self.F))) > 1.0 + 1e-9:
             raise ValueError("M_t and D_L produce an unstable velocity model")
 
+    def discrete_matrices(self, dt: float) -> tuple[Array, Array]:
+        """Return this relative model's position/velocity matrices at ``dt``.
+
+        The maintained MPC model uses a 0.10 s visual period.  SMC can receive
+        a measurement after its camera acquisition time, so it needs the same
+        dynamics at a shorter, measured delay when leading the state to the
+        current control time.
+        """
+
+        duration = float(dt)
+        if not np.isfinite(duration) or duration <= 0.0:
+            raise ValueError("dt must be finite and positive")
+        I3 = np.eye(3)
+        F, G = zero_order_hold(self.A_v, self.B_v, duration)
+        A_d = np.block(
+            [[I3, duration * F], [np.zeros((3, 3)), F]]
+        )
+        B_d = np.vstack((duration * G, G))
+        return A_d, B_d
+
     @property
     def tau_h(self) -> Array:
         """Fixed ``h(0)`` force in body FRD coordinates."""

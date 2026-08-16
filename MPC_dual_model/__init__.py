@@ -34,6 +34,14 @@ from .mpc_tracker import (
     build_default_staircase_fusion,
 )
 from .relative_kalman import KalmanConfig, RelativePositionKalmanFilter
+from .smc_controller import (
+    AxisSMCConfig,
+    ForwardDistanceGuardConfig,
+    FullVehicleSMCController,
+    RelativeStateEstimator,
+    SMCTracker,
+    build_smc_tracker,
+)
 from .vision_measurement import (
     PipelineJsonlTail,
     VisionGateConfig,
@@ -74,6 +82,12 @@ __all__ = [
     "MPCTracker",
     "RelativeMPCController",
     "RelativePositionKalmanFilter",
+    "AxisSMCConfig",
+    "ForwardDistanceGuardConfig",
+    "FullVehicleSMCController",
+    "RelativeStateEstimator",
+    "SMCTracker",
+    "build_smc_tracker",
     "PipelineJsonlTail",
     "SafeControlOutput",
     "TrackerOutput",

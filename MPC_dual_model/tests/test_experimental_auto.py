@@ -31,8 +31,8 @@ class ExperimentalAutoTests(unittest.TestCase):
         )
         self.assertEqual(runtime["hardware_adapter"]["yaw_channel_limit"], 0.20)
         controller = runtime["auto_runtime"]["active_mpc_parameters"]["controller"]
-        self.assertEqual(controller["delta_force_min"], [-0.80, -0.80, -1.00])
-        self.assertEqual(controller["delta_force_max"], [0.80, 0.80, 1.00])
+        self.assertEqual(controller["delta_force_min"], [-1.20, -0.80, -1.00])
+        self.assertEqual(controller["delta_force_max"], [1.20, 0.80, 1.00])
         tracker = build_auto_tracker(runtime)
         self.assertIsInstance(tracker, MPCTracker)
         self.assertEqual(runtime["auto_runtime"]["required_model"], "dual")
@@ -81,8 +81,11 @@ class ExperimentalAutoTests(unittest.TestCase):
         )
         self.assertEqual(report.vision_gate_config.startup_confirmation_samples, 1)
         self.assertEqual(report.vision_gate_config.reacquire_confirmation_samples, 1)
-        self.assertTrue(report.vision_gate_config.clamp_implausible_steps)
-        self.assertEqual(report.vision_gate_config.max_depth_nis, 100.0)
+        self.assertFalse(report.vision_gate_config.clamp_implausible_steps)
+        self.assertEqual(report.vision_gate_config.max_depth_nis, 25.0)
+        self.assertEqual(report.vision_gate_config.jump_margin_m, 0.20)
+        self.assertEqual(report.vision_gate_config.max_step_m, 0.30)
+        self.assertEqual(report.vision_gate_config.max_inter_sample_gap_s, 1.00)
         configured_forward_range = source["experimental_auto"][
             "vision_gate_overrides"
         ]["forward_range_m"]

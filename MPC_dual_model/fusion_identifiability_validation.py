@@ -132,8 +132,23 @@ def _circular_mean(values: Iterable[float]) -> float:
     return float(math.atan2(np.mean(np.sin(array)), np.mean(np.cos(array))))
 
 
-def _load_overhead(path: Path) -> dict[str, np.ndarray]:
-    connection = sqlite3.connect(path)
+def _load_overhead(
+    path: Path,
+    *,
+    read_only_snapshot: bool = False,
+) -> dict[str, np.ndarray]:
+    """Load the overhead-camera status stream from a ROS2 SQLite bag.
+
+    The live error plot may read a bag while ``ros2 bag record`` is writing it.
+    In that case use an immutable read-only connection so the reader never
+    takes a SQLite lock that can terminate the recorder.  A partially written
+    snapshot is allowed to fail and will be retried by the live source.
+    """
+    if read_only_snapshot:
+        uri = f"file:{Path(path).resolve()}?mode=ro&immutable=1"
+        connection = sqlite3.connect(uri, uri=True, timeout=0.0)
+    else:
+        connection = sqlite3.connect(path)
     try:
         row = connection.execute(
             "SELECT id FROM topics WHERE name='/finsrov/vision/status'"

@@ -30,6 +30,7 @@ class VisionGateConfig:
     max_forward_m: float = 1.50
     max_speed_m_s: float = 1.0
     jump_margin_m: float = 0.10
+    max_step_m: float = 0.30
     max_inter_sample_gap_s: float = 0.50
     startup_confirmation_samples: int = 3
     reacquire_confirmation_samples: int = 5
@@ -45,12 +46,15 @@ class VisionGateConfig:
             self.max_forward_m,
             self.max_speed_m_s,
             self.jump_margin_m,
+            self.max_step_m,
             self.max_inter_sample_gap_s,
         )
         if not all(math.isfinite(value) and value > 0.0 for value in positive):
             raise ValueError("vision gate limits must be finite and positive")
         if self.max_forward_m <= self.min_forward_m:
             raise ValueError("max_forward_m must exceed min_forward_m")
+        if self.max_step_m < self.jump_margin_m:
+            raise ValueError("max_step_m must be at least jump_margin_m")
         if not 0.0 <= self.min_confidence <= 1.0:
             raise ValueError("min_confidence must be in [0, 1]")
         if not 0.0 <= self.min_depth_confidence <= 1.0:
@@ -63,6 +67,14 @@ class VisionGateConfig:
         if not modes or any(not value for value in modes):
             raise ValueError("accepted depth filter modes must be nonempty")
         object.__setattr__(self, "accepted_depth_filter_modes", modes)
+
+    def step_limit(self, dt: float) -> float:
+        """Return the bounded spatial step allowed for one visual sample."""
+
+        return min(
+            self.jump_margin_m + self.max_speed_m_s * float(dt),
+            self.max_step_m,
+        )
 
 
 @dataclass(frozen=True)
@@ -261,7 +273,7 @@ class VisionMeasurementGate:
                 current.position_camera_xyz_m - previous.position_camera_xyz_m
             )
         )
-        limit = self.config.jump_margin_m + self.config.max_speed_m_s * dt
+        limit = self.config.step_limit(dt)
         return distance <= limit
 
     def _clamp_step(
@@ -274,7 +286,7 @@ class VisionMeasurementGate:
         dt = current.acquisition_time_s - previous.acquisition_time_s
         delta = current.position_camera_xyz_m - previous.position_camera_xyz_m
         distance = float(np.linalg.norm(delta))
-        limit = self.config.jump_margin_m + self.config.max_speed_m_s * dt
+        limit = self.config.step_limit(dt)
         if distance <= limit or distance <= np.finfo(float).eps:
             return current
         return VisionMeasurement(
@@ -339,6 +351,13 @@ class VisionMeasurementGate:
                 self._pending = None
                 self._pending_count = 0
                 return VisionGateDecision(True, "tracking_clamped", clamped, 1)
+            # When clamping is disabled, retain the last trusted sample and
+            # reject the entire implausible step.  Do not pass the first bad
+            # sample into the reacquisition counter: with a one-sample
+            # reacquire setting, that would accept a sustained false-depth
+            # track on the very next frame.
+            if 0.0 < gap <= self.config.max_inter_sample_gap_s:
+                return self._reject("implausible_step")
             if gap > self.config.max_inter_sample_gap_s:
                 self._last_accepted = None
 

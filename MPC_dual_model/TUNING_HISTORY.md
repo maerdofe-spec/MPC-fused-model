@@ -1156,6 +1156,36 @@ to one position/velocity gated EMA on all axes, with a moderate speed-up from
 `0.08` to `0.20 m/s`.  The `0.20 m` position gate is unchanged.  This change is
 upper-controller configuration only; no hardware run has started with it.
 
+## 2026-08-15: H15 run — forward-end visual depth instability
+
+The follow-up H15 trace is
+`calibration_logs/experimental_auto_20260815_210721.jsonl`. During the
+straight-forward endpoint, raw visual frames `108493--108790` repeatedly
+alternated between approximately `0.36` and `1.08 m` camera depth. The raw
+vision stream also showed `0.15--0.25 m` jumps, approximately `0.20 s`
+acquisition gaps, low depth quality, and NIS spikes above `200`. The interval
+is excluded from offline MPC evaluation only; the raw trace is preserved and
+the exclusion is recorded in
+`calibration_logs/experimental_auto_20260815_210721.analysis.json`.
+
+The whole trace had forward/right/down MAE `3.36/2.38/1.59 cm` and 3-D P95
+`15.85 cm`. After excluding the visual interval, MAE became
+`2.70/2.35/1.60 cm` and 3-D P95 `11.69 cm`; no MPC or firmware parameters were
+changed. In the clean return segment (`frames 109800--110400`), raw depth
+stayed around `0.58--0.63 m`, 3-D P95 was `7.79 cm`, and maximum applied motor
+throttle was `0.097`. This confirms that the apparent forward-end oscillation
+is primarily an intermittent visual measurement problem; the return appears
+better because the measurement stream becomes continuous again.
+
+The clean portions support good static/near-static holding, but every sustained
+forward-depth excursion in this run overlaps degraded or jumping depth
+measurements. Therefore a forward MPC lag cannot be identified independently
+and no parameter change is justified. The experiment decision is to redesign
+the next run: use `5--10 cm` forward/back steps, keep the target in the stable
+`0.55--0.75 m` visual-depth band, hold each step for `10 s`, and repeat three
+cycles. Vision quality will be classified offline only; the online controller
+and visual code remain unchanged.
+
 ## 2026-08-15: H15 fusion run — visual endpoint exclusion and high-speed model check
 
 The H15 upper-controller run is recorded in
@@ -1179,3 +1209,198 @@ velocity sign change, frames `84910--84940` reduced the weight to a median of
 selector did distinguish this transition; the near-zero-acceleration plateau
 itself still favored model 1. MPC was stopped by operator request; the vision
 window and live error plot remain running.
+
+## 2026-08-15: H15 redesigned small-step run — forward error remains dominant
+
+The run is recorded in `calibration_logs/experimental_auto_20260815_212453.jsonl`;
+the raw trace remains unchanged. The operator performed the planned axes, but
+the depth also ranged from `0.331` to `1.076 m`, so larger hand-motion rows are
+retained but are not treated as the clean `5--10 cm` baseline. The offline
+summary is `calibration_logs/experimental_auto_20260815_212453.analysis.json`.
+
+Across the trace, estimated FRD absolute error P95 was
+`11.2/5.9/5.1 cm`. Restricting to the clean small-step rule (depth
+`0.50--0.70 m`, camera `|x|,|y| <= 0.12 m`) gave `7.4/5.7/4.9 cm`; static
+forward P95 was still about `6.3 cm`, while dynamic forward P95 was about
+`17.5 cm`. Dynamic forward model-1 weight had median `0.023` and model 1 had
+lower candidate MSE in only `17.1%` of dynamic samples, so the large dynamic
+error is not caused by an indistinguishable fusion decision. Forward command
+occasionally reached the `+/-0.20` channel/force boundary, but applied motor
+throttle peaked at only `0.261`, well below the `0.50` motor limit. QP updates
+were solved; vision acquisition P50/P95/max was `0.101/0.199/0.603 s`.
+
+The next decision is a single parameter change, not a model or vision change:
+test only forward `position_weight 800 -> 1000`, with horizon, fusion,
+force/rate weights, vision and firmware unchanged. Repeat the small forward /
+back step protocol at `0.55--0.75 m` and compare P95, overshoot, return time and
+channel saturation. No parameter was changed by this run.
+
+## 2026-08-15: forward weight 1000 run — high-speed segment is rate-limited, not motor-limited
+
+The run is `calibration_logs/experimental_auto_20260815_215856.jsonl`; the
+raw trace remains preserved and the detailed analysis is in
+`calibration_logs/experimental_auto_20260815_215856.analysis.json`. Forward
+position weight was the only staged change (`800 -> 1000`).
+
+The clean small-step region (depth `0.50--0.70 m`, camera `|x|,|y| <= 0.12 m`)
+had estimated error P95 `8.2/6.0/5.5 cm` (forward/right/down), so forward did
+not yet establish a reliable improvement to the 5 cm target. The later
+high-speed samples (`|v_forward| >= 0.10 m/s`) had forward error P50/P95/max
+`6.7/25.1/60.7 cm`. Model-1 weight median was only `0.03` on forward, so
+model 2 was selected during the fast motion.
+
+This was not final-motor saturation: maximum applied throttle was `0.274`,
+well below `0.50`. However, the first planned forward force increment hit the
+`+/-0.80 N` rate bound in about `65%` of high-speed samples; forward command
+also occasionally reached the experimental `+/-0.20` channel envelope. The
+main high-speed bottleneck is therefore force-rate/actuator dynamics, not a
+lack of position weight or final motor authority. A later fast interval also
+contained substantial lateral/vertical motion, so it is marked as a mixed
+high-speed segment rather than a pure forward benchmark. The pool-top MP4 was
+still open and lacked a final `moov` atom, so quantitative frame extraction was
+not possible without closing the camera recorder.
+
+Next decision: test only forward `delta_force_min/max +/-0.80 -> +/-1.00 N`,
+keep position weight `1000` and all other settings fixed, then repeat a
+straight high-speed forward/back segment using the overhead view to constrain
+lateral/vertical motion. No parameter was changed by this analysis.
+
+## 2026-08-15: AUTO startup diagnosis after forward-weight change
+
+After staging forward `position_weight 800 -> 1000`, three launch attempts
+(`experimental_auto_20260815_213656.jsonl`, `214232.jsonl` and
+`215120.jsonl`) produced only a `start` record and no `control_update`. The
+default configuration pointed to the old 2026-08-13 vision JSONL, whose tail
+was not advancing, so `measurement_fresh` never became true. The guarded AUTO
+therefore correctly stayed in `DISARMED_HANDSHAKE` and sent no MPC command.
+
+The UDP transport was not the root cause: the experiment uses
+`remote_host=192.168.0.2` (reachable), while `host=192.168.138.2` is the old
+TCP field and must not be used for this check. A disarmed link test confirmed
+fresh telemetry, execution feedback and `mpc_direct=1`; it also records the
+lower-controller yaw mode, which must be `LOCAL_HOLD` (`telemetry_yaw_direct=0`)
+for the translation model.
+
+The retry using the live vision path
+`real_device_20260815_200705/pipeline_results.jsonl` entered `ACTIVE` and
+generated 192 solved control updates in
+`experimental_auto_20260815_215559.jsonl` before the operator stopped it.
+This short run is not a tuning result; it only proves that the corrected
+vision path and lower-controller mode allow the staged parameter to run.
+
+## 2026-08-15: forward-rate run — control solved, confirmation watchdog tripped
+
+The run is `calibration_logs/experimental_auto_20260815_221903.jsonl`.
+It entered `ACTIVE` after the live vision path became valid and produced 1460
+control updates over about 158 s. The final event was
+`armed command confirmation stale`; this is a communication/acknowledgement
+safety stop, not a vision rejection, QP fallback, or motor saturation.
+
+Immediately before the stop, MPC status was `solved`, the maximum slack was
+about `8e-8`, tracker computation was about `9.1 ms`, and the largest final
+motor throttle in the complete run was about `0.362`, below the `0.45--0.50`
+motor-limit diagnostic threshold. The last requested channels were only
+`[-0.079, +0.046, +0.009]`, so the stop was not caused by the experimental
+translation envelope either. The last control record was followed by the
+watchdog stop after roughly `0.24 s`, matching the configured
+`confirmation_max_age_sec=0.25` boundary.
+
+A subsequent 4 s disarmed diagnostic sending `yaw_direct=0` received 78/79
+fresh telemetry samples, with accepted commands and no reject flags. This
+supports an intermittent telemetry/command-echo gap (or a host receive delay)
+under the continuous 20 Hz AUTO stream, rather than a persistent lower
+controller fault. Do not tune MPC from this run. Before the next long test,
+collect confirmation round-trip/telemetry-age diagnostics; if the gap recurs,
+adjust the watchdog margin or transport handling as a communication fix and
+repeat the same motion, keeping MPC parameters unchanged.
+
+The useful control portion of this same run is also informative after
+separating obvious depth bursts. In the raw vision stream, frame `231199`
+has `depth_nis=572.8` and frame `231223` has `depth_nis=325.3`; similar bursts
+occur at `231343` and `231355`. The current experimental gate rejects those
+individual samples but then accepts several following low-NIS samples while
+the depth track is still wrong, using `clamp_implausible_steps`. Around
+`231199--231244`, the camera depth walks from about `0.624` to `1.35 m` and
+back to `0.58 m`, producing a spurious body-forward error up to about `0.74 m`.
+Those rows must be excluded from MPC performance scoring; they are a vision
+burst, not a vehicle response.
+
+After excluding the two obvious bursts (`231199--231244` and
+`231343--231367`), low-speed samples (`|v|<0.03 m/s`) have forward error
+median/P95 about `2.8/8.8 cm`. Forward dynamic samples (`|v_forward|>0.10
+m/s`) have error median/P95 about `6.6/25.2 cm`, while the forward model-1
+weight has median about `0.02` (model 2 is correctly selected). In contrast,
+the low-speed model-1 median is about `0.68`; the fusion distinction is
+therefore visible in this run rather than being lost in noise.
+
+The dynamic bottleneck is the forward force-rate constraint: the first
+planned forward increment reaches the current `+/-1.00 N` bound in about
+`56%` of samples with `|v_forward|>0.10 m/s`. The forward channel reaches its
+`+/-0.20` envelope in only about `8%` of those samples, and clean dynamic
+motor throttle peaks at about `0.289`, far below the final motor limit. Thus
+the remaining dynamic lag is consistent with force-rate/actuator dynamics,
+not model confusion or final-motor saturation. The next tuning experiment
+should change only the forward force-rate limit (or, preferably, first
+validate the actuator time constant) and keep position weights unchanged;
+the visual-burst rows must remain marked invalid for scoring.
+
+## 2026-08-15: depth continuity gate for the next tuning run
+
+To prevent the sustained false-depth sequence observed in the previous run,
+the experimental host-side vision gate now keeps the absolute range at
+`0.30--1.40 m` but changes the motion handling to:
+
+- `clamp_implausible_steps=false`: an implausible sample is rejected and the
+  last trusted measurement is retained; it is not converted into a gradual
+  fake trajectory;
+- `jump_margin_m=0.20`, `max_speed_m_s=1.0`, and a hard
+  `max_step_m=0.30 m`, so the allowed spatial jump is at most about `0.30 m`
+  per visual update and never expands with a long sample gap;
+- `max_inter_sample_gap_s=1.0`, allowing the last trusted depth to remain the
+  reference while a short false burst is rejected.
+
+The previous JSONL replay rejects the `231199--231220` false-depth run and
+does not feed its `0.74 m` apparent forward error to MPC; the measurement is
+accepted again when the depth returns near the last trusted value. This is an
+MPC-side input gate change only; the tracking-depth code and firmware are
+unchanged. The staged MPC weights and forward `+/-1.00 N` force-rate limit
+remain unchanged for the next comparison run.
+
+## 2026-08-15: repeated AUTO startup stall caused by stale vision JSONL
+
+The launch `experimental_auto_20260815_233324.jsonl` contained only its
+`start` record. The MPC preflight output still pointed to the old
+`finesub_v4pro1_camera_cal_20260812_run02/pipeline_results.jsonl`, whose tail
+was not advancing. The active vision producer was instead writing
+`real_device_20260815_200705/pipeline_results.jsonl`. Because the guarded
+runtime tails the selected file from EOF, no fresh measurement could arrive;
+it correctly stayed in `DISARMED_HANDSHAKE` and never entered `ACTIVE`.
+
+This was a recurrence of the startup fault already documented above, not a
+new MPC or SMC behavior difference. The lower link was independently healthy:
+`link_diag_20260815_2336.csv` recorded 200 disarmed rows, 197 unique fresh
+telemetry sequences, 198 accepted command confirmations, and no armed or
+nonzero command. The operator stopped the stalled AUTO before any control
+update.
+
+Before every real-device launch, identify the currently growing
+`pipeline_results.jsonl`, pass it explicitly with `--vision-jsonl`, and verify
+that its tail timestamp advances. Do not rely on the dated path in
+`finesub_v4pro1_mpc.json`; it is only a historical default. The preflight must
+print the same live path before adding `--execute`.
+
+## 2026-08-15: overhead target-speed panel data coverage and SQLite lock
+
+The target-speed panel was blank for most of
+`experimental_auto_20260815_234505.jsonl` because the paired pool-top bag
+`top_camera_live_20260815_234411` covered only 15.4 s, while the MPC trace
+covered 96.7 s; only two control samples overlapped the bag time range. The
+bag recorder also stopped with SQLite `database is locked` while the live
+plot was reading the writable database.
+
+The plot reader now opens a read-only immutable SQLite snapshot, so it cannot
+hold a writer lock. A speed value is still only available when the status
+stream contains at least 20 simultaneous target Tag 17 and vehicle Tag 15/16
+detections; if Tag 17 is not visible, an empty speed panel is expected. For a
+live experiment, keep the pool-top recorder running for the complete MPC run
+and keep the target tag in view.

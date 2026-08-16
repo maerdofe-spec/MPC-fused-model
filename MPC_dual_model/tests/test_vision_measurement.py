@@ -160,6 +160,44 @@ class VisionMeasurementGateTests(unittest.TestCase):
         self.assertEqual(decision.reason, "tracking_clamped")
         self.assertAlmostEqual(decision.measurement.position_camera_xyz_m[2], 0.65)
 
+    def test_implausible_step_rejects_sustained_false_depth_when_not_clamped(self):
+        config = VisionGateConfig(
+            max_forward_m=3.0,
+            jump_margin_m=0.05,
+            max_speed_m_s=1.0,
+            startup_confirmation_samples=1,
+            reacquire_confirmation_samples=1,
+            clamp_implausible_steps=False,
+        )
+        gate = VisionMeasurementGate(config)
+        first = record(1, 10.0, position=(0.0, 0.0, 0.5))
+        self.assertTrue(gate.evaluate(first, now_s=10.02).control_ready)
+        false_depth = [
+            record(index, 10.0 + index * 0.1, position=(0.0, 0.0, 1.35))
+            for index in range(2, 6)
+        ]
+        decisions = [
+            gate.evaluate(value, now_s=value["result_time"] + 0.01)
+            for value in false_depth
+        ]
+        self.assertEqual(
+            [item.reason for item in decisions],
+            ["implausible_step"] * 4,
+        )
+        recovered = record(6, 10.5, position=(0.0, 0.0, 0.51))
+        decision = gate.evaluate(recovered, now_s=recovered["result_time"] + 0.01)
+        self.assertTrue(decision.control_ready, decision.reason)
+        self.assertEqual(decision.reason, "tracking")
+
+    def test_spatial_step_limit_is_hard_capped(self):
+        config = VisionGateConfig(
+            jump_margin_m=0.20,
+            max_speed_m_s=1.0,
+            max_step_m=0.30,
+        )
+        self.assertAlmostEqual(config.step_limit(0.10), 0.30)
+        self.assertAlmostEqual(config.step_limit(0.50), 0.30)
+
     def test_rejects_four_frame_depth_excursion_and_recovers(self):
         self.lock()
         frame = 4

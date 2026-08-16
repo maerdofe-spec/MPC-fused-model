@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import json
 from pathlib import Path
+import sqlite3
 import time
 from typing import Iterable
 
@@ -29,6 +30,136 @@ class PositionErrorSample:
     estimated_error_m: np.ndarray
     estimated_velocity_m_s: np.ndarray
     model1_weight: np.ndarray
+    wall_time_s: float = float("nan")
+    target_absolute_speed_m_s: float = float("nan")
+    # SMC diagnostics are optional so the MPC plot can continue to consume
+    # the same trace schema.  NaN means that the selected trace did not carry
+    # that field (for example, a legacy MPC record).
+    smc_desired_acceleration_m_s2: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=float)
+    )
+    smc_sliding_variable: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=float)
+    )
+    requested_force_frd_n: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=float)
+    )
+    achieved_force_frd_n: np.ndarray = field(
+        default_factory=lambda: np.full(3, np.nan, dtype=float)
+    )
+    camera_forward_distance_m: float = float("nan")
+    camera_forward_force_before_guard_n: float = float("nan")
+    camera_forward_force_after_guard_n: float = float("nan")
+    vision_measurement_age_s: float = float("nan")
+
+
+@dataclass
+class OverheadTargetVelocitySource:
+    """Read target speed from a pool-top ROS2 SQLite bag for visualization only.
+
+    The source uses AprilTag 17's world-frame XY velocity from the existing
+    overhead-camera loader.  It never feeds the MPC or alters the control
+    trace.  A directory is accepted and resolves to its newest ``*.db3`` file.
+    """
+
+    path: Path | None
+    refresh_interval_s: float = 1.0
+    _times_s: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=float), init=False
+    )
+    _velocity_xy_m_s: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2), dtype=float), init=False
+    )
+    _signature: tuple[int, int] | None = field(default=None, init=False)
+    _last_refresh_monotonic_s: float = field(default=-float("inf"), init=False)
+    _next_retry_monotonic_s: float = field(default=-float("inf"), init=False)
+    _failure_backoff_s: float = field(default=1.0, init=False)
+
+    def _database_path(self) -> Path | None:
+        if self.path is None:
+            return None
+        candidate = Path(self.path)
+        if candidate.is_dir():
+            databases = list(candidate.glob("*.db3"))
+            if not databases:
+                return None
+            try:
+                return max(
+                    databases,
+                    key=lambda path: (path.stat().st_mtime_ns, path.name),
+                )
+            except OSError:
+                return None
+        return candidate
+
+    def _refresh_if_needed(self) -> None:
+        # ros2 bag writes the SQLite file before it writes metadata.yaml.  A
+        # live database is not a stable snapshot and can be reported as
+        # malformed while the recorder is appending pages.  Do not repeatedly
+        # scan that file from the GUI timer; the speed panel will populate once
+        # the recorder is stopped and metadata.yaml is finalized.
+        if self.path is not None and self.path.is_dir():
+            if not (self.path / "metadata.yaml").exists():
+                return
+        database = self._database_path()
+        if database is None:
+            return
+        now = time.monotonic()
+        if now < self._next_retry_monotonic_s:
+            return
+        if now - self._last_refresh_monotonic_s < self.refresh_interval_s:
+            return
+        self._last_refresh_monotonic_s = now
+        try:
+            stat = database.stat()
+            signature = (int(stat.st_size), int(stat.st_mtime_ns))
+            if signature == self._signature and self._times_s.size:
+                return
+            # Import lazily so the live plot remains usable without a bag or
+            # without loading the offline MPC fusion analysis module.
+            from .fusion_identifiability_validation import _load_overhead
+
+            overhead = _load_overhead(database, read_only_snapshot=True)
+            times = np.asarray(overhead["time"], dtype=float)
+            velocity = np.asarray(overhead["target_velocity"], dtype=float)
+            valid = (
+                np.isfinite(times)
+                & np.all(np.isfinite(velocity), axis=1)
+            )
+            self._times_s = times[valid]
+            self._velocity_xy_m_s = velocity[valid]
+            self._signature = signature
+            self._failure_backoff_s = 1.0
+            self._next_retry_monotonic_s = -float("inf")
+        except (OSError, ValueError, sqlite3.Error, KeyError, TypeError):
+            # A bag can be incomplete while the top-camera recorder is still
+            # writing.  Keep the last valid source and leave the panel blank
+            # until a readable snapshot is available.  Back off retries so a
+            # malformed/incomplete database cannot monopolize the GUI thread.
+            self._next_retry_monotonic_s = now + self._failure_backoff_s
+            self._failure_backoff_s = min(30.0, self._failure_backoff_s * 2.0)
+            return
+
+    def speed_at(self, wall_time_s: float) -> float:
+        """Return interpolated target speed, or NaN outside the bag range."""
+
+        self._refresh_if_needed()
+        query = float(wall_time_s)
+        if (
+            not np.isfinite(query)
+            or self._times_s.size == 0
+            or query < self._times_s[0]
+            or query > self._times_s[-1]
+        ):
+            return float("nan")
+        velocity = np.array(
+            [
+                np.interp(query, self._times_s, self._velocity_xy_m_s[:, axis])
+                for axis in range(2)
+            ],
+            dtype=float,
+        )
+        return float(np.linalg.norm(velocity))
 
 
 def load_default_reference(config_path: str | Path) -> np.ndarray:
@@ -75,12 +206,44 @@ def extract_position_error_sample(
         candidate = np.asarray(weight_value, dtype=float).reshape(-1)
         if candidate.shape == (3,) and np.all(np.isfinite(candidate)):
             model1_weight = candidate
+    def optional_vector(name: str) -> np.ndarray:
+        value = record.get(name)
+        if value is None:
+            return np.full(3, np.nan, dtype=float)
+        candidate = np.asarray(value, dtype=float).reshape(-1)
+        if candidate.shape != (3,) or not np.all(np.isfinite(candidate)):
+            return np.full(3, np.nan, dtype=float)
+        return candidate.copy()
+
+    def optional_scalar(name: str) -> float:
+        value = record.get(name)
+        try:
+            candidate = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return candidate if np.isfinite(candidate) else float("nan")
+
     return PositionErrorSample(
         time_s=timestamp,
         measured_error_m=measured - reference,
         estimated_error_m=estimated - reference,
         estimated_velocity_m_s=velocity,
         model1_weight=model1_weight,
+        wall_time_s=float(record.get("host_time_s", float("nan"))),
+        smc_desired_acceleration_m_s2=optional_vector(
+            "smc_desired_acceleration_frd_m_s2"
+        ),
+        smc_sliding_variable=optional_vector("smc_sliding_variable"),
+        requested_force_frd_n=optional_vector("requested_force_frd_n"),
+        achieved_force_frd_n=optional_vector("achieved_force_previous_frd_n"),
+        camera_forward_distance_m=optional_scalar("camera_forward_distance_m"),
+        camera_forward_force_before_guard_n=optional_scalar(
+            "camera_forward_force_before_guard_n"
+        ),
+        camera_forward_force_after_guard_n=optional_scalar(
+            "camera_forward_force_after_guard_n"
+        ),
+        vision_measurement_age_s=optional_scalar("vision_measurement_age_s"),
     )
 
 
@@ -92,16 +255,20 @@ class JsonlTraceFollower:
         trace_path: str | Path | None,
         log_directory: str | Path,
         default_reference: np.ndarray,
+        overhead_source: OverheadTargetVelocitySource | None = None,
+        trace_pattern: str = "experimental_auto_*.jsonl",
     ) -> None:
         self.explicit_path = None if trace_path is None else Path(trace_path).resolve()
         self.log_directory = Path(log_directory).resolve()
         self.default_reference = np.asarray(default_reference, dtype=float)
+        self.overhead_source = overhead_source
+        self.trace_pattern = str(trace_pattern)
         self.path: Path | None = None
         self.offset = 0
         self.partial = ""
 
     def _latest_trace(self) -> Path | None:
-        candidates = list(self.log_directory.glob("experimental_auto_*.jsonl"))
+        candidates = list(self.log_directory.glob(self.trace_pattern))
         if not candidates:
             return None
         return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.name))
@@ -143,6 +310,13 @@ class JsonlTraceFollower:
                 continue
             sample = extract_position_error_sample(record, self.default_reference)
             if sample is not None:
+                if self.overhead_source is not None:
+                    sample = replace(
+                        sample,
+                        target_absolute_speed_m_s=self.overhead_source.speed_at(
+                            sample.wall_time_s
+                        ),
+                    )
                 samples.append(sample)
         return switched, samples
 
@@ -154,9 +328,11 @@ class LivePositionErrorPlot:
         *,
         window_s: float = 60.0,
         maximum_samples: int = 12000,
+        show_target_speed: bool = True,
     ) -> None:
         self.follower = follower
         self.window_s = float(window_s)
+        self.show_target_speed = bool(show_target_speed)
         self.samples: deque[PositionErrorSample] = deque(maxlen=maximum_samples)
         self.figure, axes = plt.subplots(3, 2, figsize=(11, 8.5), sharex=True)
         self.axes = tuple(axes.ravel())
@@ -219,18 +395,17 @@ class LivePositionErrorPlot:
         weight_axis.legend(loc="lower right")
 
         velocity_axis = self.axes[5]
-        self.velocity_lines = []
-        for axis_index in range(3):
-            line, = velocity_axis.plot(
-                [], [], color=AXIS_COLORS[axis_index], linewidth=1.6,
-                label=AXIS_NAMES[axis_index],
-            )
-            self.velocity_lines.append(line)
+        self.target_speed_line, = velocity_axis.plot(
+            [], [], color="tab:orange", linewidth=1.8,
+            label="Target absolute speed",
+        )
         velocity_axis.axhline(0.0, color="black", linewidth=0.7, alpha=0.5)
-        velocity_axis.set_title("Estimated relative velocity")
+        velocity_axis.set_title("Pool-top target absolute speed (visual only)")
         velocity_axis.set_ylabel("Velocity (m/s)")
         velocity_axis.grid(True, alpha=0.25)
-        velocity_axis.legend(loc="upper right", ncols=3)
+        velocity_axis.legend(loc="upper right")
+        if not self.show_target_speed:
+            velocity_axis.set_visible(False)
 
         for axis in self.axes[4:]:
             axis.set_xlabel("Time in current trace (s)")
@@ -264,8 +439,8 @@ class LivePositionErrorPlot:
         estimated_cm = 100.0 * np.vstack(
             [sample.estimated_error_m for sample in visible]
         )
-        estimated_velocity = np.vstack(
-            [sample.estimated_velocity_m_s for sample in visible]
+        target_speed = np.asarray(
+            [sample.target_absolute_speed_m_s for sample in visible], dtype=float
         )
         model1_weight = np.vstack([sample.model1_weight for sample in visible])
         for axis_index, axis in enumerate(self.axes[:3]):
@@ -288,17 +463,16 @@ class LivePositionErrorPlot:
             max(10.0, float(np.nanpercentile(norms_cm, 99.0)) * 1.2),
         )
         self.model1_forward_weight_line.set_data(times, model1_weight[:, 0])
-        for axis_index in range(3):
-            self.velocity_lines[axis_index].set_data(
-                times, estimated_velocity[:, axis_index]
+        if self.show_target_speed:
+            self.target_speed_line.set_data(times, target_speed)
+        finite_speed = target_speed[np.isfinite(target_speed)]
+        if self.show_target_speed:
+            velocity_limit = (
+                max(0.02, float(np.nanpercentile(finite_speed, 99.0)) * 1.2)
+                if finite_speed.size
+                else 0.02
             )
-        finite_velocity = estimated_velocity[np.isfinite(estimated_velocity)]
-        velocity_limit = (
-            max(0.02, float(np.nanpercentile(np.abs(finite_velocity), 99.0)) * 1.2)
-            if finite_velocity.size
-            else 0.02
-        )
-        self.axes[5].set_ylim(-velocity_limit, velocity_limit)
+            self.axes[5].set_ylim(-velocity_limit, velocity_limit)
         left = max(float(times[-1]) - self.window_s, float(times[0]))
         right = max(float(times[-1]), left + 1.0)
         for axis in self.axes:
@@ -341,6 +515,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(Path(__file__).resolve().parents[1] / "calibration_logs"),
     )
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
+    parser.add_argument(
+        "--overhead-bag",
+        help=(
+            "pool-top ROS2 SQLite bag or directory containing *.db3; "
+            "used only for target absolute-speed visualization"
+        ),
+    )
     parser.add_argument("--window-sec", type=float, default=60.0)
     parser.add_argument("--refresh-ms", type=int, default=200)
     parser.add_argument("--save-png", help="optional snapshot path")
@@ -353,7 +534,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.window_sec <= 0.0 or args.refresh_ms <= 0:
         raise SystemExit("window-sec and refresh-ms must be positive")
     reference = load_default_reference(args.config)
-    follower = JsonlTraceFollower(args.trace_jsonl, args.log_directory, reference)
+    overhead_source = (
+        None
+        if args.overhead_bag is None
+        else OverheadTargetVelocitySource(Path(args.overhead_bag).resolve())
+    )
+    follower = JsonlTraceFollower(
+        args.trace_jsonl,
+        args.log_directory,
+        reference,
+        overhead_source=overhead_source,
+    )
     plot = LivePositionErrorPlot(follower, window_s=args.window_sec)
     plot.refresh()
     if args.snapshot_only:

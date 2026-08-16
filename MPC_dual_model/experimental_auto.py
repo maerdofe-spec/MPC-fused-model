@@ -130,6 +130,8 @@ def build_experimental_runtime_config(config: dict[str, Any]) -> dict[str, Any]:
         "forward_range_m",
         "jump_margin_m",
         "max_depth_nis",
+        "max_inter_sample_gap_s",
+        "max_step_m",
         "startup_confirmation_samples",
         "reacquire_confirmation_samples",
     }
@@ -195,6 +197,8 @@ def evaluate_experimental_readiness(
         maximum_depth_nis=100.0,
         minimum_forward_m=0.10,
         maximum_forward_m=2.80,
+        maximum_jump_margin_m=0.20,
+        maximum_step_m=0.30,
     )
     evidence_blockers: list[str] = []
     experimental = config.get("experimental_auto", {})

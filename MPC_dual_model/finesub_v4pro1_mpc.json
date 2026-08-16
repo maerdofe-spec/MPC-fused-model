@@ -20,7 +20,7 @@
     "required_model": "dual-yaw",
     "require_execute_flag": true,
     "legacy_joystick_csrt_entry_allowed_for_auto": false,
-    "vision_jsonl": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/finesub_v4pro1_camera_cal_20260812_run02/pipeline_results.jsonl",
+    "vision_jsonl": "/data/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/finesub_mpc_q1200_20260816_151258/pipeline_results.jsonl",
     "vision_source_access": "read_only_tail; MPC must not modify the tracking_depth repository or output",
     "arming_sequence": [
       "accepted disarmed zero establishes a new random command session",
@@ -77,10 +77,12 @@
     "vision_quality_gate_enabled": true,
     "vision_gate_overrides": {
       "accepted_depth_filter_modes": ["update", "weak_update"],
-      "clamp_implausible_steps": true,
+      "clamp_implausible_steps": false,
       "forward_range_m": [0.30, 1.40],
-      "jump_margin_m": 0.05,
-      "max_depth_nis": 100.0,
+      "jump_margin_m": 0.20,
+      "max_depth_nis": 25.0,
+      "max_inter_sample_gap_s": 1.00,
+      "max_step_m": 0.30,
       "startup_confirmation_samples": 1,
       "reacquire_confirmation_samples": 1
     },
@@ -88,7 +90,7 @@
     "lock_reference_to_first_valid_position": false,
     "operator_acceptance_date": "2026-08-13",
     "purpose": "Real-device MPC experiment tracking the red fish with the current best camera/body and three-axis dynamic candidates; detector confidence remains disabled, while the existing depth-quality, innovation, range and motion gates are enabled after the 2026-08-13 outlier-driven control test.",
-    "vision_jsonl": "/home/fins/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/finesub_v4pro1_camera_cal_20260812_run02/pipeline_results.jsonl",
+    "vision_jsonl": "/data/Zhouyuheng_workspace/tracking_depth/depth-estimation-dev/output/finesub_mpc_q1200_20260816_151258/pipeline_results.jsonl",
     "vision_source_access": "read_only_tail; MPC must not modify or operate the tracking_depth repository",
     "max_channel_abs": 0.20,
     "expected_vision_update_period_s": 0.10,
@@ -181,7 +183,7 @@
       "controller": {
         "horizon": 15,
         "reference_position": [0.857634, -0.055545, -0.120815],
-        "position_weights": [800.0, 350.0, 900.0],
+        "position_weights": [1200.0, 350.0, 900.0],
         "velocity_weights": [150.0, 150.0, 200.0],
         "terminal_weight_scale": 2.0,
         "force_weights": [0.60, 0.50, 0.80],
@@ -191,8 +193,8 @@
         "actuator_time_constant_s": 0.15,
         "force_min": [-5.050680, -4.783308, -6.867140],
         "force_max": [4.730162, 4.997534, 7.063140],
-        "delta_force_min": [-0.80, -0.80, -1.00],
-        "delta_force_max": [0.80, 0.80, 1.00],
+        "delta_force_min": [-1.20, -0.80, -1.00],
+        "delta_force_max": [1.20, 0.80, 1.00],
         "thruster_command_matrix": [
           [1.0, 0.0, 0.0],
           [0.0, 1.0, 0.0],

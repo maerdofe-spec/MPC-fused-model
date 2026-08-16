@@ -60,6 +60,13 @@ class RelativePositionKalmanFilter:
         self.initialized = True
         return self.x.copy()
 
+    def reset(self) -> None:
+        """Forget the previous target track before a fresh reacquisition."""
+
+        self.x = np.zeros(6)
+        self.P = np.eye(6)
+        self.initialized = False
+
     def predict(self, tau_achieved, yaw_delta_rad: float = 0.0) -> np.ndarray:
         """Predict the target-stationary Fossen branch.
 
@@ -79,6 +86,47 @@ class RelativePositionKalmanFilter:
             self.model.A_d @ self.x + self.model.B_d @ effective_force
         )
         process_covariance = rotation @ self.Q @ rotation.T
+        self.P = transition @ self.P @ transition.T + process_covariance
+        self.P = 0.5 * (self.P + self.P.T)
+        return self.x.copy()
+
+    def predict_ahead(
+        self,
+        tau_achieved,
+        duration_s: float,
+        yaw_delta_rad: float = 0.0,
+    ) -> np.ndarray:
+        """Lead a filtered visual state from acquisition time to control time.
+
+        Vision timestamps describe when the stereo image was acquired, while
+        the controller runs after inference has completed.  A variable
+        inference delay is otherwise interpreted as a stale position with a
+        current velocity, which is especially harmful to a high-gain rate
+        controller.  This uses the same fixed-damping model as the normal MPC
+        prediction, with exact ZOH matrices for the measured delay.
+        """
+
+        if not self.initialized:
+            raise RuntimeError("filter must be initialized before predict_ahead")
+        duration = float(duration_s)
+        if not np.isfinite(duration) or duration < 0.0:
+            raise ValueError("duration_s must be finite and non-negative")
+        if duration <= 1.0e-9:
+            return self.x.copy()
+
+        effective_force = (
+            vector3(tau_achieved, "tau_achieved")
+            - self.model.restoring_force
+        )
+        A_d, B_d = self.model.discrete_matrices(duration)
+        rotation = rotation_state_body_from_previous(yaw_delta_rad)
+        transition = rotation @ A_d
+        self.x = rotation @ (A_d @ self.x + B_d @ effective_force)
+        # The configured Q is per visual period.  Scale it for the shorter
+        # delay interval without creating a second estimator configuration.
+        process_covariance = rotation @ (
+            self.Q * (duration / self.model.dt)
+        ) @ rotation.T
         self.P = transition @ self.P @ transition.T + process_covariance
         self.P = 0.5 * (self.P + self.P.T)
         return self.x.copy()

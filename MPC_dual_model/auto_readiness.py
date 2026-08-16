@@ -19,6 +19,7 @@ from MPC_dual_model_yaw.auto_tracker import (
 )
 from .finesub_protocol import PROTOCOL_VERSION, build_runtime_hardware_adapter
 from .finesub_transport import load_runtime_config
+from .smc_controller import build_smc_tracker
 from .vision_measurement import VisionGateConfig
 
 
@@ -92,6 +93,7 @@ def vision_gate_config_from_runtime(config: dict[str, Any]) -> VisionGateConfig:
         max_forward_m=float(forward[1]),
         max_speed_m_s=float(gate["max_speed_m_s"]),
         jump_margin_m=float(gate["jump_margin_m"]),
+        max_step_m=float(gate.get("max_step_m", 0.30)),
         max_inter_sample_gap_s=float(gate.get("max_inter_sample_gap_s", 0.50)),
         startup_confirmation_samples=int(gate["startup_confirmation_samples"]),
         reacquire_confirmation_samples=int(gate["reacquire_confirmation_samples"]),
@@ -138,6 +140,8 @@ def evaluate_auto_readiness(
     maximum_depth_nis: float = 25.0,
     minimum_forward_m: float = 0.15,
     maximum_forward_m: float = 1.50,
+    maximum_jump_margin_m: float = 0.10,
+    maximum_step_m: float = 0.30,
 ) -> AutoReadinessReport:
     """Return all blockers without opening a camera, socket, or serial port."""
 
@@ -155,9 +159,10 @@ def evaluate_auto_readiness(
     if auto.get("legacy_joystick_csrt_entry_allowed_for_auto") is not False:
         blockers.append("legacy joystick/CSRT AUTO entry is not explicitly disabled")
     required_model = auto.get("required_model")
-    if required_model not in {"dual", "dual-yaw"} or selected_model != required_model:
+    if required_model not in {"dual", "dual-yaw", "smc-full"} or selected_model != required_model:
         blockers.append(
-            "AUTO selected model must exactly match required_model (dual or dual-yaw)"
+            "AUTO selected model must exactly match required_model "
+            "(dual, dual-yaw or smc-full)"
         )
 
     vision_jsonl = _resolve(path, auto.get("vision_jsonl"))
@@ -263,7 +268,11 @@ def evaluate_auto_readiness(
             or gate_config.max_forward_m > float(maximum_forward_m)
         ):
             blockers.append("vision forward range exceeds the authorized envelope")
-        if gate_config.max_speed_m_s > 1.0 or gate_config.jump_margin_m > 0.10:
+        if (
+            gate_config.max_speed_m_s > 1.0
+            or gate_config.jump_margin_m > float(maximum_jump_margin_m)
+            or gate_config.max_step_m > float(maximum_step_m)
+        ):
             blockers.append("vision motion gate is weaker than the replayed limit")
         if (
             gate_config.startup_confirmation_samples
@@ -347,22 +356,24 @@ def evaluate_auto_readiness(
         blockers.append("RPM/force prior is not confirmed as the same physical vehicle")
 
     try:
-        tracker = (
-            build_translation_auto_tracker(config)
-            if selected_model == "dual"
-            else build_rotation_auto_tracker(config)
-        )
-        solver_settings = _nested(
-            config,
-            "auto_runtime",
-            "active_mpc_parameters",
-            "controller",
-            "solver_settings",
-        )
-        if solver_settings.get("backend") != "osqp":
-            blockers.append("formal AUTO requires the explicit OSQP backend")
-        if float(solver_settings["time_limit_seconds"]) > 0.035:
-            blockers.append("OSQP time limit must not exceed 0.035 s")
+        if selected_model == "dual":
+            tracker = build_translation_auto_tracker(config)
+        elif selected_model == "dual-yaw":
+            tracker = build_rotation_auto_tracker(config)
+        else:
+            tracker = build_smc_tracker(config)
+        if selected_model != "smc-full":
+            solver_settings = _nested(
+                config,
+                "auto_runtime",
+                "active_mpc_parameters",
+                "controller",
+                "solver_settings",
+            )
+            if solver_settings.get("backend") != "osqp":
+                blockers.append("formal AUTO requires the explicit OSQP backend")
+            if float(solver_settings["time_limit_seconds"]) > 0.035:
+                blockers.append("OSQP time limit must not exceed 0.035 s")
         model_dt = tracker.model.dt
         expected_model_dt = (
             float(control["period_sec"])
@@ -376,22 +387,35 @@ def evaluate_auto_readiness(
         adapter_cfg = _mapping(config.get("hardware_adapter"))
         positive = np.asarray(adapter_cfg["positive_force_at_limit"], dtype=float)
         negative = np.asarray(adapter_cfg["negative_force_at_limit"], dtype=float)
-        controller = tracker.controller.config
-        if np.any(controller.force_max > positive + 1.0e-9) or np.any(
-            controller.force_min < -negative - 1.0e-9
+        hardware = build_runtime_hardware_adapter(config)
+        if selected_model == "smc-full":
+            controller = tracker.controller
+            force_max = controller.positive_force_limit
+            force_min = -controller.negative_force_limit
+            yaw_max = controller.positive_yaw_limit
+            yaw_min = -controller.negative_yaw_limit
+        else:
+            controller = tracker.controller.config
+            force_max = controller.force_max
+            force_min = controller.force_min
+            yaw_max = yaw_min = None
+            if selected_model == "dual-yaw":
+                yaw_controller = tracker.yaw_controller.config
+                yaw_max = yaw_controller.yaw_moment_max
+                yaw_min = yaw_controller.yaw_moment_min
+        if np.any(force_max > positive + 1.0e-9) or np.any(
+            force_min < -negative - 1.0e-9
         ):
-            blockers.append("MPC force bounds exceed the hardware conversion envelope")
-        if selected_model == "dual-yaw":
-            yaw_controller = tracker.yaw_controller.config
-            if (
-                yaw_controller.yaw_moment_max
-                > adapter.positive_yaw_moment_at_limit + 1.0e-9
-                or yaw_controller.yaw_moment_min
-                < -adapter.negative_yaw_moment_at_limit - 1.0e-9
-            ):
-                blockers.append(
-                    "yaw moment bounds exceed the hardware conversion envelope"
-                )
+            blockers.append(
+                f"{selected_model} force bounds exceed the hardware conversion envelope"
+            )
+        if yaw_max is not None and (
+            yaw_max > hardware.positive_yaw_moment_at_limit + 1.0e-9
+            or yaw_min < -hardware.negative_yaw_moment_at_limit - 1.0e-9
+        ):
+            blockers.append(
+                f"{selected_model} yaw moment bounds exceed the hardware conversion envelope"
+            )
     except (
         AutoParameterError,
         ImportError,
@@ -446,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH))
     parser.add_argument(
-        "--model", choices=("dual", "dual-yaw"), default="dual-yaw"
+        "--model", choices=("dual", "dual-yaw", "smc-full"), default="dual-yaw"
     )
     args = parser.parse_args(argv)
     config = load_runtime_config(args.config)

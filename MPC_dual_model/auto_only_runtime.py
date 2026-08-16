@@ -29,6 +29,7 @@ from MPC_dual_model_yaw.auto_tracker import (
     build_auto_tracker as build_rotation_auto_tracker,
 )
 from .camera_transform import camera_to_body_position, wrap_angle
+from .smc_controller import build_smc_tracker
 from .finesub_protocol import (
     FineSUBControlCommand,
     build_runtime_hardware_adapter,
@@ -98,6 +99,9 @@ def _build_runtime_tracker(config: dict[str, Any]):
         return _TranslationRuntimeTracker(build_translation_auto_tracker(config)), False
     if required_model == "dual-yaw":
         return build_rotation_auto_tracker(config), True
+    if required_model == "smc-full":
+        tracker = build_smc_tracker(config)
+        return tracker, tracker.yaw_direct
     raise ValueError(f"unsupported AUTO model: {required_model!r}")
 
 
@@ -123,7 +127,7 @@ def _assert_command_yaw_mode(
         raise RuntimeError("command yaw_direct flag contradicts selected model")
     if not yaw_direct and abs(float(command.yaw)) > 1.0e-12:
         raise RuntimeError(
-            "translation MPC attempted a nonzero direct yaw command"
+            "translation controller attempted a nonzero direct yaw command"
         )
 
 
@@ -268,9 +272,9 @@ def run_auto_only(
 
     yaw_authority = "DIRECT_YAW" if yaw_direct else "LOWER_LOCAL_HOLD"
     logger(
-        f"[{runtime_label}] Starting guarded camera/MPC tracking session; "
+        f"[{runtime_label}] Starting guarded camera control session; "
         f"model={required_model} yaw={yaw_authority}; "
-        "no joystick/manual mode exists"
+        "no joystick/manual mode exists; FineSUB transport and MCU mixer retained"
     )
     try:
         with trace_context as trace_handle:
@@ -609,6 +613,10 @@ def run_auto_only(
                         yaw_rate_body_frd_rad_s = (
                             telemetry.body_frd_yaw_rate_rad_s
                         )
+                        measurement_delay_s = max(
+                            0.0,
+                            time.time() - new_measurement.acquisition_time_s,
+                        )
                         tracker_update_started = time.perf_counter()
                         update_kwargs = dict(
                             position_body=position_body,
@@ -618,7 +626,18 @@ def run_auto_only(
                             yaw_rad=telemetry.yaw_rad,
                             yaw_rate_rad_s=yaw_rate_body_frd_rad_s,
                         )
-                        if not yaw_direct:
+                        if required_model == "smc-full":
+                            # SMC's relative Kalman state is timestamped at
+                            # image acquisition.  Lead it to the current
+                            # control time using the same yaw-frame
+                            # compensation that is used between visual
+                            # updates.  The established yaw MPC path keeps
+                            # its existing interface unchanged.
+                            update_kwargs["yaw_delta_rad"] = yaw_delta_rad
+                            update_kwargs["measurement_delay_s"] = (
+                                measurement_delay_s
+                            )
+                        elif not yaw_direct:
                             update_kwargs["yaw_delta_rad"] = yaw_delta_rad
                         output = tracker.update(**update_kwargs)
                         previous_control_yaw_rad = float(telemetry.yaw_rad)
@@ -626,7 +645,10 @@ def run_auto_only(
                             time.perf_counter() - tracker_update_started
                         ) * 1000.0
                         if output.mpc.used_fallback:
-                            fatal_reason = f"MPC solver fallback: {output.mpc.status}"
+                            fatal_reason = (
+                                f"{required_model} controller fallback: "
+                                f"{output.mpc.status}"
+                            )
                             break
                         last_command = hardware_adapter.convert(
                             output.mpc.force,
@@ -647,6 +669,12 @@ def run_auto_only(
                             new_measurement.acquisition_time_s
                         )
                         planned_step_count = min(3, len(output.mpc.force_sequence))
+                        smc_output = getattr(output, "smc", None)
+                        smc_axes = (
+                            ()
+                            if smc_output is None
+                            else tuple(smc_output.translation_axes)
+                        )
                         fusion_difference = (
                             tracker.fusion.M1
                             + tracker.fusion.M2
@@ -664,6 +692,7 @@ def run_auto_only(
                                 new_measurement.result_time_s
                                 - new_measurement.acquisition_time_s
                             ),
+                            vision_measurement_age_s=float(measurement_delay_s),
                             vision_acquisition_interval_s=(
                                 None
                                 if acquisition_interval_s is None
@@ -680,6 +709,71 @@ def run_auto_only(
                             ),
                             estimated_state=list(map(float, output.estimated_state)),
                             requested_force_frd_n=list(map(float, output.mpc.force)),
+                            # SMC-only diagnostics make model/force-box
+                            # mismatch visible in the trace.  The requested
+                            # channel authority is intentionally not changed
+                            # by this instrumentation.
+                            smc_unsaturated_force_frd_n=(
+                                None
+                                if smc_output is None
+                                else list(map(float, smc_output.unsaturated_force))
+                            ),
+                            smc_desired_acceleration_frd_m_s2=(
+                                None
+                                if not smc_axes
+                                else [
+                                    float(axis.desired_acceleration)
+                                    for axis in smc_axes
+                                ]
+                            ),
+                            smc_position_error=(
+                                None
+                                if not smc_axes
+                                else [float(axis.position_error) for axis in smc_axes]
+                            ),
+                            smc_rate_reference=(
+                                None
+                                if not smc_axes
+                                else [float(axis.rate_reference) for axis in smc_axes]
+                            ),
+                            smc_sliding_variable=(
+                                None
+                                if not smc_axes
+                                else [
+                                    float(axis.sliding_variable)
+                                    for axis in smc_axes
+                                ]
+                            ),
+                            camera_forward_distance_m=(
+                                None
+                                if getattr(tracker, "last_forward_distance_m", None)
+                                is None
+                                else float(tracker.last_forward_distance_m)
+                            ),
+                            camera_forward_force_before_guard_n=(
+                                None
+                                if getattr(
+                                    tracker,
+                                    "last_forward_force_before_guard_n",
+                                    None,
+                                )
+                                is None
+                                else float(
+                                    tracker.last_forward_force_before_guard_n
+                                )
+                            ),
+                            camera_forward_force_after_guard_n=(
+                                None
+                                if getattr(
+                                    tracker,
+                                    "last_forward_force_after_guard_n",
+                                    None,
+                                )
+                                is None
+                                else float(
+                                    tracker.last_forward_force_after_guard_n
+                                )
+                            ),
                             requested_channels=[
                                 last_command.forward,
                                 last_command.right,
