@@ -1,8 +1,23 @@
 # FineSUB MPC 控制
 
+## 目录导航
+
+```text
+control/          Python 控制器、辅助脚本及测试
+V4pro1_MPC/       下位机固件（Git 子模块，位置不变）
+raw_data/         原始实验数据及标定依据
+docs/             使用说明与控制协议
+```
+
+根目录仅保留本说明和正式/实验 AUTO 两个常用启动入口，以及版本管理、开发配置。
+`calibration_logs` 是旧数据路径的兼容连接，不重复存储数据。
+其他控制脚本已移入 `control/`；使用 `python -m MPC_dual_model...` 或导入控制包时，
+先进入 `control`，或将其加入 `PYTHONPATH`。分类入口见 [控制实现](control/README.md)
+和 [使用说明](docs/README.md)。
+
 本仓库包含单模型、双模型融合以及带偏航控制的 MPC。正式实机运行采用独立的
 无手柄 AUTO-only 入口 `finesub_auto_control.py`，模型固定为 `dual-yaw`；旧
-`rov_track_control3.py` 只保留手动/CSRT 查看用途，不能进入 AUTO。
+`control/rov_track_control3.py` 只保留手动/CSRT 查看用途，不能进入 AUTO。
 
 ## 克隆完整工程
 
@@ -26,7 +41,7 @@ git submodule update --init --recursive
 
 控制坐标统一为机体系 FRD：x 向前、y 向右、z 向下，正偏航力矩使艇首
 向右。MPC 输出物理量 `[Fx, Fy, Fz, N]`，
-`MPC_dual_model/finesub_protocol.py` 按标定值转换为固件混控器的归一化
+`control/MPC_dual_model/finesub_protocol.py` 按标定值转换为固件混控器的归一化
 `[forward, right, down, yaw]` 通道。
 
 v5 控制帧包含版本、显式解锁位、yaw 控制来源、随机会话号、16 位序号、发送
@@ -38,7 +53,7 @@ IMU、深度/压力、命令接受或拒绝原因、混控后真正下发的 8 �
 进入自动 MPC；固件连续 250 ms 没有接受合法 MPC 帧时会清零并停桨。
 
 完整帧格式、拒绝原因和安全状态机见协议文档与
-`MPC_dual_model/finesub_protocol.py`。
+`control/MPC_dual_model/finesub_protocol.py`。
 
 以下 `--model` 表只适用于仿真、库示例和旧诊断程序，不适用于正式 AUTO：
 
@@ -54,14 +69,14 @@ IMU、深度/压力、命令接受或拒绝原因、混控后真正下发的 8 �
 在本目录由 uv 管理依赖。默认命令只预检，不连接硬件：
 
 ```powershell
-uv sync --project MPC_dual_model --group dev
-uv run --project MPC_dual_model python finesub_auto_control.py
+uv sync --project control/MPC_dual_model --group dev
+uv run --project control/MPC_dual_model python finesub_auto_control.py
 ```
 
 只有预检输出 `AUTO READY` 后才运行：
 
 ```powershell
-uv run --project MPC_dual_model python finesub_auto_control.py --execute
+uv run --project control/MPC_dual_model python finesub_auto_control.py --execute
 ```
 
 当前实机配置仍会输出 `AUTO BLOCKED`，原因是相机刚性外参与完整三轴实机动力学没有通过
@@ -74,19 +89,19 @@ uv run --project MPC_dual_model python finesub_auto_control.py --execute
 MPC+红鱼视觉实物追踪。为避免把实验结论伪装成正式批准，独立预检入口为：
 
 ```powershell
-uv run --project MPC_dual_model python finesub_experimental_auto.py
+uv run --project control/MPC_dual_model python finesub_experimental_auto.py
 ```
 
 预检输出 `EXPERIMENTAL AUTO READY` 后，实验执行命令为：
 
 ```powershell
-uv run --project MPC_dual_model python finesub_experimental_auto.py --execute
+uv run --project control/MPC_dual_model python finesub_experimental_auto.py --execute
 ```
 
 若视觉系统每次在新的时间戳目录写结果，可由 MPC 只读指定该文件：
 
 ```powershell
-uv run --project MPC_dual_model python finesub_experimental_auto.py --execute --vision-jsonl /absolute/path/to/pipeline_results.jsonl
+uv run --project control/MPC_dual_model python finesub_experimental_auto.py --execute --vision-jsonl /absolute/path/to/pipeline_results.jsonl
 ```
 
 实验固定使用 `dual-yaw`、目标相机光轴距离 `0.60 m`（当前候选外参对应 body FRD
@@ -97,13 +112,13 @@ uv run --project MPC_dual_model python finesub_experimental_auto.py --execute --
 通信方式、地址、安全时间和硬件换算参数位于：
 
 ```text
-MPC_dual_model/finesub_v4pro1_mpc.json
+control/MPC_dual_model/finesub_v4pro1_mpc.json
 ```
 
 也可以指定其他配置：
 
 ```powershell
-uv run --project MPC_dual_model python finesub_auto_control.py --config path/to/finesub.json
+uv run --project control/MPC_dual_model python finesub_auto_control.py --config path/to/finesub.json
 ```
 
 配置中的 `transport.type` 支持 `tcp`、`udp`、`serial` 和 `dry_run`。
@@ -130,7 +145,7 @@ MPC 使用 8 路真实 RPM 与逐电机正反向二次曲线重构已实现控�
 视频输入还要求操作系统已安装 GStreamer、H.264 解码插件和 PyGObject (`gi`)；
 这些组件应使用目标机的系统包管理器安装。
 
-旧 `rov_track_control3.py` 仍可用于手动/CSRT 诊断：`S` 框选、`Z` 停止、`Q` 退出，
+旧 `control/rov_track_control3.py` 仍可用于手动/CSRT 诊断：`S` 框选、`Z` 停止、`Q` 退出，
 按钮 7 手动解锁/停桨；按钮 3 只会打印 `AUTO BLOCKED`，不会切换模式。
 
 程序退出时会发送显式停桨帧。没有视频、遥测过期、命令确认过期、网络中断或
@@ -140,7 +155,9 @@ MPC 使用 8 路真实 RPM 与逐电机正反向二次曲线重构已实现控�
 
 ```powershell
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD="1"
-uv run --project MPC_dual_model pytest -q MPC_dual_model/tests
+Push-Location control
+uv run --project MPC_dual_model python -m pytest -q MPC_dual_model/tests
+Pop-Location
 ```
 
 ## 下水前必须标定
@@ -149,3 +166,10 @@ uv run --project MPC_dual_model pytest -q MPC_dual_model/tests
 视场角以及“目标框宽度到距离”的比例仍是占位/初始值。首次联调应卸桨验证
 CRC、通道顺序、符号和 250 ms 失联停机，再系留低限幅测试；未经这些步骤不
 应直接自动下水。
+
+## 原始数据归档
+
+实验数据集中保存在 `raw_data/`，分类和逐文件 SHA-256 校验值见该目录的
+`README.md` 与 `INVENTORY.csv`。根目录 `calibration_logs` 是指向归档位置的
+兼容连接，仅供旧命令使用，不上传到 GitHub。控制配置和默认实验日志路径
+直接使用 `raw_data/calibration_logs`，克隆后无需创建这些连接即可读取归档数据。

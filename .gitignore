@@ -23,7 +23,10 @@ htmlcov/
 *.log
 *.tmp
 *.bak
-calibration_logs/
+/calibration_logs/
+/control/calibration_logs/
+# Raw experiment logs are part of the archived dataset.
+!/raw_data/**/*.log
 
 # Local configuration and secrets
 .env
